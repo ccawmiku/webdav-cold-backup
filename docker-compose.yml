@@ -1,0 +1,19 @@
+services:
+  webdav-cold-backup:
+    image: ghcr.io/ccawmiku/webdav-cold-backup:v1.0.0
+    container_name: webdav-cold-backup
+    restart: unless-stopped
+    user: "${WCB_UID:-65532}:${WCB_GID:-65532}"
+    ports:
+      - "${WCB_PORT:-8080}:8080"
+    environment:
+      WCB_LISTEN_ADDR: 0.0.0.0:8080
+      WCB_CONFIG_DIR: /config
+      WCB_CACHE_DIR: /cache
+      WCB_SOURCE_ROOT: /sources
+      WCB_RESTORE_ROOT: /restore
+    volumes:
+      - ${WCB_CONFIG_PATH:-./data/config}:/config
+      - ${WCB_CACHE_PATH:-./data/cache}:/cache
+      - ${WCB_SOURCE_PATH:-./data/sources}:/sources:ro
+      - ${WCB_RESTORE_PATH:-./data/restore}:/restore

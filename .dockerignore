@@ -1,0 +1,10 @@
+.git
+.github
+.env
+bin
+coverage
+tmp
+web/node_modules
+web/dist
+*.db
+*.log

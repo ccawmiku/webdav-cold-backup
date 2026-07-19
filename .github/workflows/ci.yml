@@ -1,0 +1,131 @@
+name: CI and release artifacts
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GO_VERSION: 1.26.5
+  NODE_VERSION: 24.15.0
+
+jobs:
+  native-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+      - name: Frontend lint, format, tests, and production build
+        working-directory: web
+        run: |
+          npm run lint
+          npm run format:check
+          npm test
+          npm run build
+      - name: Go formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: Go vet
+        run: go vet ./cmd/... ./internal/...
+      - name: Go tests with race detector
+        run: go test -race -coverprofile=coverage.out ./cmd/... ./internal/...
+      - name: Build Linux server
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/webdav-cold-backup ./cmd/server
+      - name: Build Windows recovery tool
+        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -X github.com/ccawmiku/webdav-cold-backup/internal/version.Version=${GITHUB_REF_NAME}" -o bin/webdav-cold-backup-restore-windows-amd64.exe ./cmd/restore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webdav-cold-backup-${{ github.ref_name }}-binaries
+          path: bin/*
+          if-no-files-found: error
+
+  security:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Go vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./cmd/... ./internal/...
+      - name: Frontend production dependency audit
+        working-directory: web
+        run: npm audit --omit=dev --audit-level=high
+
+  container-test:
+    runs-on: ubuntu-24.04
+    needs: native-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build container locally inside GitHub Actions
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: webdav-cold-backup:test
+          build-args: VERSION=${{ github.ref_name }}
+      - name: Run container smoke test
+        run: |
+          mkdir -p "$RUNNER_TEMP/wcb/config" "$RUNNER_TEMP/wcb/cache" "$RUNNER_TEMP/wcb/sources" "$RUNNER_TEMP/wcb/restore"
+          chmod -R 777 "$RUNNER_TEMP/wcb"
+          docker run -d --name wcb-smoke -p 18080:8080 \
+            -v "$RUNNER_TEMP/wcb/config:/config" \
+            -v "$RUNNER_TEMP/wcb/cache:/cache" \
+            -v "$RUNNER_TEMP/wcb/sources:/sources:ro" \
+            -v "$RUNNER_TEMP/wcb/restore:/restore" \
+            webdav-cold-backup:test
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18080/api/health; then exit 0; fi
+            sleep 1
+          done
+          docker logs wcb-smoke
+          exit 1
+      - name: Stop smoke-test container
+        if: always()
+        run: docker rm -f wcb-smoke || true
+
+  publish-container:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    needs: [native-tests, security, container-test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/ccawmiku/webdav-cold-backup:${{ github.ref_name }}
+          build-args: VERSION=${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/ccawmiku/webdav-cold-backup
+            org.opencontainers.image.version=${{ github.ref_name }}
