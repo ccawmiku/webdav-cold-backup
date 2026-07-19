@@ -2,7 +2,6 @@ package backup
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,8 +18,6 @@ import (
 	"github.com/ccawmiku/webdav-cold-backup/internal/state"
 	"github.com/google/uuid"
 )
-
-var errSourceChanged = errors.New("source changed while creating an object")
 
 type Engine struct {
 	State       *state.Store
@@ -56,11 +53,12 @@ type buildJob struct {
 }
 
 type jobResult struct {
-	built   object.BuiltObject
-	fileIDs []string
-	label   string
-	bytes   int64
-	err     error
+	built          object.BuiltObject
+	fileIDs        []string
+	skippedFileIDs []string
+	label          string
+	bytes          int64
+	err            error
 }
 
 func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repository, settings model.GlobalSettings) (model.RunRecord, error) {
@@ -111,12 +109,6 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 		FilesTotal: len(scan.Files),
 	}
 	reportProgress(progress)
-	if scan.IgnoredSymlinks > 0 {
-		run.Details = append(run.Details, fmt.Sprintf("已忽略%d个符号链接", scan.IgnoredSymlinks))
-	}
-	if scan.IgnoredSystem > 0 {
-		run.Details = append(run.Details, fmt.Sprintf("已忽略%d个回收站或系统目录", scan.IgnoredSystem))
-	}
 	previous, hasPrevious, err := e.previousState(ctx, task)
 	if err != nil {
 		return finish(model.RunFailed, err.Error(), err)
@@ -274,6 +266,8 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 	blocksByFile := make(map[string][]model.BlockRef)
 	objects := []model.ObjectRecord{}
 	failedFiles := make(map[string]string)
+	skippedFiles := make(map[string]struct{})
+	successfulObjects := []object.BuiltObject{}
 	for result := range results {
 		progress.ObjectsCompleted++
 		progress.BytesCompleted += result.bytes
@@ -282,6 +276,9 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 			progress.Percent = 45 + 45*float64(progress.ObjectsCompleted)/float64(progress.ObjectsTotal)
 		}
 		reportProgress(progress)
+		for _, fileID := range result.skippedFileIDs {
+			skippedFiles[fileID] = struct{}{}
+		}
 		if result.err != nil {
 			for _, fileID := range result.fileIDs {
 				failedFiles[fileID] = result.err.Error()
@@ -289,15 +286,33 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 			run.Details = append(run.Details, result.err.Error())
 			continue
 		}
-		run.BytesUploaded += result.built.Record.Size
-		objects = append(objects, result.built.Record)
-		for _, payloadFile := range result.built.Metadata.Files {
+		if result.built.Record.Path != "" {
+			successfulObjects = append(successfulObjects, result.built)
+		}
+	}
+	for _, built := range successfulObjects {
+		discard := false
+		for _, payloadFile := range built.Metadata.Files {
+			if _, skipped := skippedFiles[payloadFile.FileID]; skipped {
+				discard = true
+				break
+			}
+		}
+		if discard {
+			if issues := repo.DeletePaths(ctx, task.Name, []string{built.Record.Path}); len(issues) > 0 {
+				run.Details = append(run.Details, "清理因源文件变化而失去引用的数据对象失败")
+			}
+			continue
+		}
+		run.BytesUploaded += built.Record.Size
+		objects = append(objects, built.Record)
+		for _, payloadFile := range built.Metadata.Files {
 			blocksByFile[payloadFile.FileID] = append(blocksByFile[payloadFile.FileID], model.BlockRef{
-				ObjectPath: result.built.Record.Path, ObjectID: result.built.Record.ID,
-				GroupID: result.built.Record.GroupID, Part: result.built.Record.Part,
-				TotalParts: result.built.Record.TotalParts, Offset: payloadFile.Offset,
+				ObjectPath: built.Record.Path, ObjectID: built.Record.ID,
+				GroupID: built.Record.GroupID, Part: built.Record.Part,
+				TotalParts: built.Record.TotalParts, Offset: payloadFile.Offset,
 				Length: payloadFile.Length, FileOffset: payloadFile.FileOffset,
-				ObjectSize: result.built.Record.Size, ObjectHash: result.built.Record.Hash,
+				ObjectSize: built.Record.Size, ObjectHash: built.Record.Hash,
 			})
 		}
 	}
@@ -309,6 +324,15 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 
 	missing := []string{}
 	for _, item := range prepared {
+		if _, skipped := skippedFiles[item.source.ID]; skipped {
+			if task.Mode == model.TaskModeSnapshot && item.previous != nil {
+				key := fileKey(item.previous.RootAlias, item.previous.RelativePath)
+				if !containsEntry(entries, key) {
+					entries = append(entries, *item.previous)
+				}
+			}
+			continue
+		}
 		failure := failedFiles[item.source.ID]
 		blocks := blocksByFile[item.source.ID]
 		if failure == "" && !blocksCoverFile(blocks, item.source.Size) {
@@ -490,17 +514,14 @@ func (e *Engine) executeJobs(ctx context.Context, task model.Task, repo *reposit
 					results <- jobResult{fileIDs: job.fileIDs, label: job.label, bytes: job.bytes, err: err}
 					continue
 				}
-				built, err := object.Build(ctx, job.spec)
-				if err == nil {
-					err = validateSourcesUnchanged(job.spec.Slices)
-				}
-				if err == nil {
+				built, activeFileIDs, skippedFileIDs, err := buildUnchangedObject(ctx, job.spec)
+				if err == nil && built.Record.Path != "" {
 					err = e.uploadWithRetry(ctx, repo, task.Name, built)
 				}
 				if built.TempPath != "" {
 					_ = os.Remove(built.TempPath)
 				}
-				results <- jobResult{built: built, fileIDs: job.fileIDs, label: job.label, bytes: job.bytes, err: err}
+				results <- jobResult{built: built, fileIDs: activeFileIDs, skippedFileIDs: skippedFileIDs, label: job.label, bytes: job.bytes, err: err}
 			}
 		}()
 	}
@@ -641,19 +662,73 @@ func changedSinceScan(file scanner.File) bool {
 	return err != nil || info.Size() != file.Size || !info.ModTime().Equal(file.Modified)
 }
 
-func validateSourcesUnchanged(slices []object.Slice) error {
-	seen := map[string]struct{}{}
-	for _, slice := range slices {
-		if _, exists := seen[slice.File.AbsolutePath]; exists {
+func buildUnchangedObject(ctx context.Context, spec object.BuildSpec) (object.BuiltObject, []string, []string, error) {
+	skipped := map[string]struct{}{}
+	for {
+		stable, changed := partitionUnchangedSlices(spec.Slices)
+		for _, fileID := range changed {
+			skipped[fileID] = struct{}{}
+		}
+		spec.Slices = stable
+		if len(spec.Slices) == 0 {
+			return object.BuiltObject{}, nil, mapKeys(skipped), nil
+		}
+		built, err := object.Build(ctx, spec)
+		if err != nil {
+			stable, changed = partitionUnchangedSlices(spec.Slices)
+			if len(changed) == 0 {
+				return object.BuiltObject{}, sliceFileIDs(spec.Slices), mapKeys(skipped), err
+			}
+			for _, fileID := range changed {
+				skipped[fileID] = struct{}{}
+			}
+			spec.Slices = stable
 			continue
 		}
-		seen[slice.File.AbsolutePath] = struct{}{}
+		stable, changed = partitionUnchangedSlices(spec.Slices)
+		if len(changed) == 0 {
+			return built, sliceFileIDs(spec.Slices), mapKeys(skipped), nil
+		}
+		_ = os.Remove(built.TempPath)
+		for _, fileID := range changed {
+			skipped[fileID] = struct{}{}
+		}
+		spec.Slices = stable
+	}
+}
+
+func partitionUnchangedSlices(slices []object.Slice) ([]object.Slice, []string) {
+	changed := map[string]struct{}{}
+	for _, slice := range slices {
 		info, err := os.Stat(slice.File.AbsolutePath)
 		if err != nil || info.Size() != slice.File.Size || !info.ModTime().Equal(slice.File.Times.Modified) {
-			return errSourceChanged
+			changed[slice.File.ID] = struct{}{}
 		}
 	}
-	return nil
+	stable := make([]object.Slice, 0, len(slices))
+	for _, slice := range slices {
+		if _, skip := changed[slice.File.ID]; !skip {
+			stable = append(stable, slice)
+		}
+	}
+	return stable, mapKeys(changed)
+}
+
+func sliceFileIDs(slices []object.Slice) []string {
+	ids := map[string]struct{}{}
+	for _, slice := range slices {
+		ids[slice.File.ID] = struct{}{}
+	}
+	return mapKeys(ids)
+}
+
+func mapKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for value := range values {
+		keys = append(keys, value)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func fileKey(alias, relative string) string { return alias + "\x00" + filepath.ToSlash(relative) }

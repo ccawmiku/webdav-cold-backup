@@ -140,6 +140,55 @@ func TestArchiveModeKeepsOnlyFirstDuplicatePath(t *testing.T) {
 	}
 }
 
+func TestChangingFilesAndSystemDirectoriesAreSilentlySkipped(t *testing.T) {
+	ctx := context.Background()
+	sourceRoot := t.TempDir()
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	stablePath := filepath.Join(sourceRoot, "stable.jpg")
+	changingPath := filepath.Join(sourceRoot, "changing.jpg")
+	writeOld(t, stablePath, []byte("stable content"), old)
+	writeOld(t, changingPath, []byte("old changing content"), old)
+	writeOld(t, filepath.Join(sourceRoot, "#recycle", "deleted.jpg"), []byte("trash"), old)
+
+	stateStore, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stateStore.Close()
+	fileStore, _ := storage.NewFileStore(t.TempDir())
+	repo := repository.New(fileStore)
+	task := newTask(t, model.TaskModeSnapshot, sourceRoot)
+	_ = stateStore.SaveTask(ctx, task)
+	_, _ = repo.Initialize(ctx, task)
+	engine := backup.NewEngine(stateStore, t.TempDir(), backup.NewControl())
+	engine.RetryDelays = []time.Duration{0}
+	mutated := false
+	engine.Progress = func(progress model.TaskProgress) {
+		if progress.Phase != "uploading" || mutated {
+			return
+		}
+		mutated = true
+		if err := os.WriteFile(changingPath, []byte("new changing content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run, err := engine.Run(ctx, task, repo, model.GlobalSettings{UploadConcurrency: 1, Timezone: "Asia/Singapore"})
+	if err != nil || run.Status != model.RunComplete {
+		t.Fatalf("run should complete after silently skipping the changing file: %+v %v", run, err)
+	}
+	if len(run.Details) != 0 {
+		t.Fatalf("expected no warnings for expected exclusions: %+v", run.Details)
+	}
+	snapshots, err := stateStore.Snapshots(ctx, task.ID)
+	if err != nil || len(snapshots) != 1 {
+		t.Fatalf("unexpected snapshots: %+v %v", snapshots, err)
+	}
+	if !snapshots[0].Complete || len(snapshots[0].MissingFiles) != 0 || len(snapshots[0].Files) != 1 || snapshots[0].Files[0].RelativePath != "stable.jpg" {
+		t.Fatalf("silently skipped files leaked into the snapshot: %+v", snapshots[0])
+	}
+}
+
 func newTask(t *testing.T, mode model.TaskMode, sourceRoot string) model.Task {
 	t.Helper()
 	salt, err := cryptox.RandomSalt()
