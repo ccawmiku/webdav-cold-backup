@@ -92,7 +92,7 @@ http://群晖IP:19001
 使用的公开镜像为：
 
 ```text
-ghcr.io/ccawmiku/webdav-cold-backup:v1.0.0
+ghcr.io/ccawmiku/webdav-cold-backup:v1.1.0
 ```
 
 项目不会发布 `latest` 标签。
