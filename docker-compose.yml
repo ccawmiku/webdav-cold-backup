@@ -1,6 +1,6 @@
 services:
   webdav-cold-backup:
-    image: ghcr.io/ccawmiku/webdav-cold-backup:v1.1.0
+    image: ghcr.io/ccawmiku/webdav-cold-backup:v1.1.1
     container_name: webdav-cold-backup
     restart: unless-stopped
     # 当前群晖管理员账号的实际 UID:GID。

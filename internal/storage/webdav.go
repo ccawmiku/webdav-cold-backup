@@ -27,6 +27,18 @@ type WebDAVStore struct {
 	downloadBytesPS int64
 }
 
+type webDAVStatusError struct {
+	operation  string
+	objectPath string
+	statusCode int
+	status     string
+	message    string
+}
+
+func (e *webDAVStatusError) Error() string {
+	return fmt.Sprintf("WebDAV %s %q returned %s: %s", e.operation, e.objectPath, e.status, e.message)
+}
+
 func NewWebDAVStore(endpoint, root, username, password string, client *http.Client) (*WebDAVStore, error) {
 	parsed, err := url.Parse(strings.TrimSpace(endpoint))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
@@ -202,6 +214,29 @@ func (s *WebDAVStore) Move(ctx context.Context, source, destination string) erro
 	if err := s.MkdirAll(ctx, path.Dir(cleanRemotePath(destination))); err != nil {
 		return err
 	}
+	err := s.moveOnce(ctx, source, destination)
+	if err == nil {
+		return nil
+	}
+	var statusErr *webDAVStatusError
+	if !errors.As(err, &statusErr) || !isOverwriteRejection(statusErr.statusCode) {
+		return err
+	}
+	sourceInfo, sourceErr := s.Stat(ctx, source)
+	destinationInfo, destinationErr := s.Stat(ctx, destination)
+	if sourceErr != nil || destinationErr != nil || sourceInfo.IsDir || destinationInfo.IsDir {
+		return err
+	}
+	if deleteErr := s.Delete(ctx, destination); deleteErr != nil && !errors.Is(deleteErr, ErrNotFound) {
+		return fmt.Errorf("replace existing WebDAV object %q after overwrite was rejected: %w", destination, deleteErr)
+	}
+	if retryErr := s.moveOnce(ctx, source, destination); retryErr != nil {
+		return fmt.Errorf("replace existing WebDAV object %q after deleting the old copy: %w", destination, retryErr)
+	}
+	return nil
+}
+
+func (s *WebDAVStore) moveOnce(ctx context.Context, source, destination string) error {
 	request, err := s.request(ctx, "MOVE", source, nil)
 	if err != nil {
 		return err
@@ -217,6 +252,10 @@ func (s *WebDAVStore) Move(ctx context.Context, source, destination string) erro
 		return statusError("move", source, response)
 	}
 	return nil
+}
+
+func isOverwriteRejection(statusCode int) bool {
+	return statusCode == http.StatusMethodNotAllowed || statusCode == http.StatusConflict || statusCode == http.StatusPreconditionFailed
 }
 
 func (s *WebDAVStore) Delete(ctx context.Context, objectPath string) error {
@@ -247,6 +286,9 @@ func (s *WebDAVStore) TestCompatibility(ctx context.Context) error {
 	payload := []byte("webdav-cold-backup compatibility test")
 	partial := testID + "/test.partial"
 	final := testID + "/test.bin"
+	if err := s.Put(ctx, final, bytes.NewReader([]byte("old")), 3); err != nil {
+		return fmt.Errorf("PUT overwrite target test failed: %w", err)
+	}
 	if err := s.Put(ctx, partial, bytes.NewReader(payload), int64(len(payload))); err != nil {
 		return fmt.Errorf("PUT test failed: %w", err)
 	}
@@ -356,5 +398,8 @@ func cleanRemotePath(value string) string {
 
 func statusError(operation, objectPath string, response *http.Response) error {
 	message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-	return fmt.Errorf("WebDAV %s %q returned %s: %s", operation, objectPath, response.Status, strings.TrimSpace(string(message)))
+	return &webDAVStatusError{
+		operation: operation, objectPath: objectPath, statusCode: response.StatusCode,
+		status: response.Status, message: strings.TrimSpace(string(message)),
+	}
 }
