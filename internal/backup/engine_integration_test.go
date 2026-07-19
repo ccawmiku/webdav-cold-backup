@@ -189,6 +189,52 @@ func TestChangingFilesAndSystemDirectoriesAreSilentlySkipped(t *testing.T) {
 	}
 }
 
+func TestIncompleteFileIsRetriedEvenWhenMetadataIsUnchanged(t *testing.T) {
+	ctx := context.Background()
+	sourceRoot := t.TempDir()
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	content := []byte("repair this file")
+	filePath := filepath.Join(sourceRoot, "repair.jpg")
+	writeOld(t, filePath, content, old)
+
+	stateStore, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stateStore.Close()
+	fileStore, _ := storage.NewFileStore(t.TempDir())
+	repo := repository.New(fileStore)
+	task := newTask(t, model.TaskModeSnapshot, sourceRoot)
+	_ = stateStore.SaveTask(ctx, task)
+	_, _ = repo.Initialize(ctx, task)
+	previous := model.Snapshot{
+		ID: "previous-incomplete", TaskID: task.ID, CreatedAt: old, Complete: false, Sources: task.Sources,
+		Files: []model.FileEntry{{
+			ID: "missing-file", RootAlias: "media", RelativePath: "repair.jpg", Size: int64(len(content)),
+			Times: model.FileTimes{Modified: old, Created: old}, MissingReason: "previous upload failed",
+		}},
+		MissingFiles: []string{"media/repair.jpg"},
+	}
+	if err := stateStore.SaveSnapshot(ctx, previous); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := backup.NewEngine(stateStore, t.TempDir(), backup.NewControl())
+	engine.RetryDelays = []time.Duration{0}
+	run, err := engine.Run(ctx, task, repo, model.GlobalSettings{UploadConcurrency: 1, Timezone: "Asia/Singapore"})
+	if err != nil || run.Status != model.RunComplete || run.FilesAdded != 1 {
+		t.Fatalf("incomplete file was not retried: %+v %v", run, err)
+	}
+	snapshots, err := stateStore.Snapshots(ctx, task.ID)
+	if err != nil || len(snapshots) < 1 {
+		t.Fatalf("unexpected snapshots: %+v %v", snapshots, err)
+	}
+	latest := snapshots[0]
+	if !latest.Complete || len(latest.MissingFiles) != 0 || len(latest.Files) != 1 || latest.Files[0].MissingReason != "" || len(latest.Files[0].Blocks) == 0 {
+		t.Fatalf("retried snapshot is still incomplete: %+v", latest)
+	}
+}
+
 func newTask(t *testing.T, mode model.TaskMode, sourceRoot string) model.Task {
 	t.Helper()
 	salt, err := cryptox.RandomSalt()

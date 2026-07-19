@@ -152,7 +152,7 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 		key := fileKey(scanned.RootAlias, scanned.RelativePath)
 		seenPaths[key] = struct{}{}
 		old, pathExists := byPath[key]
-		if pathExists && sameMetadata(old, scanned) {
+		if pathExists && old.MissingReason == "" && sameMetadata(old, scanned) {
 			if task.Mode == model.TaskModeSnapshot {
 				entries = append(entries, old)
 			}
@@ -325,7 +325,7 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 	missing := []string{}
 	for _, item := range prepared {
 		if _, skipped := skippedFiles[item.source.ID]; skipped {
-			if task.Mode == model.TaskModeSnapshot && item.previous != nil {
+			if task.Mode == model.TaskModeSnapshot && item.previous != nil && item.previous.MissingReason == "" {
 				key := fileKey(item.previous.RootAlias, item.previous.RelativePath)
 				if !containsEntry(entries, key) {
 					entries = append(entries, *item.previous)
