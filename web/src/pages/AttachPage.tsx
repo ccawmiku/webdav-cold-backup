@@ -15,7 +15,8 @@ import {
 } from '@mui/material'
 import { useState } from 'react'
 import { api, body, formatDate } from '../api'
-import type { CheckResult, Task, WebDAVConfig } from '../types'
+import { WebDAVTargetPicker } from '../components/WebDAVTargetPicker'
+import type { CheckResult, Task, WebDAVSelection } from '../types'
 
 interface Descriptor {
   taskId: string
@@ -30,11 +31,9 @@ interface Props {
 }
 
 export function AttachPage({ onAttached, notify }: Props) {
-  const [remote, setRemote] = useState<WebDAVConfig>({
-    endpoint: 'http://',
-    root: 'backup',
-    username: '',
-    password: '',
+  const [webDAV, setWebDAV] = useState<WebDAVSelection>({
+    remotePresetId: '',
+    remote: { endpoint: 'http://', root: '', username: '', password: '' },
   })
   const [descriptors, setDescriptors] = useState<Descriptor[]>([])
   const [taskName, setTaskName] = useState('')
@@ -52,7 +51,7 @@ export function AttachPage({ onAttached, notify }: Props) {
     try {
       const found = await api<Descriptor[]>('/api/remotes/discover', {
         method: 'POST',
-        ...body(remote),
+        ...body(webDAV),
       })
       setDescriptors(found)
       setTaskName(found[0]?.name ?? '')
@@ -74,7 +73,7 @@ export function AttachPage({ onAttached, notify }: Props) {
         writable: boolean
       }>('/api/remotes/attach', {
         method: 'POST',
-        ...body({ remote, taskName, password, sources: [] }),
+        ...body({ ...webDAV, taskName, password, sources: [] }),
       })
       setResult(attached)
       notify(
@@ -104,31 +103,7 @@ export function AttachPage({ onAttached, notify }: Props) {
         <CardContent>
           <Stack spacing={2}>
             <Typography variant="h6">1. 连接WebDAV备份根</Typography>
-            <TextField
-              label="WebDAV地址"
-              value={remote.endpoint}
-              onChange={(event) => setRemote({ ...remote, endpoint: event.target.value })}
-            />
-            <TextField
-              label="备份根目录"
-              value={remote.root}
-              onChange={(event) => setRemote({ ...remote, root: event.target.value })}
-            />
-            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
-              <TextField
-                fullWidth
-                label="用户名"
-                value={remote.username}
-                onChange={(event) => setRemote({ ...remote, username: event.target.value })}
-              />
-              <TextField
-                fullWidth
-                type="password"
-                label="WebDAV密码"
-                value={remote.password}
-                onChange={(event) => setRemote({ ...remote, password: event.target.value })}
-              />
-            </Stack>
+            <WebDAVTargetPicker value={webDAV} onChange={setWebDAV} disabled={busy} />
             <Button
               startIcon={<CloudSyncIcon />}
               variant="outlined"

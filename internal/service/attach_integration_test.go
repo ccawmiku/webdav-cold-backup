@@ -33,7 +33,7 @@ func TestZeroStateAttachRebuildsWritableTaskAndDetectsSourceMismatch(t *testing.
 		t.Fatal(err)
 	}
 	created, err := first.CreateTask(ctx, service.CreateTaskInput{
-		Name: "reattach-task", Mode: model.TaskModeSnapshot, Password: "task password",
+		Name: "reattach-task", Mode: model.TaskModeSnapshot, Password: "task password", PasswordConfirm: "task password",
 		Sources: []model.SourceRoot{{Path: source, Alias: "media"}}, Remote: remote,
 		BlockSize: 1_000_000_000, Retention: 3, Schedule: model.Schedule{Type: model.ScheduleManual},
 	})
@@ -97,7 +97,7 @@ func TestRestoreImportedDownloadedTaskDirectory(t *testing.T) {
 	}
 	defer app.Close()
 	task, err := app.CreateTask(ctx, service.CreateTaskInput{
-		Name: "import-task", Mode: model.TaskModeSnapshot, Password: "task password",
+		Name: "import-task", Mode: model.TaskModeSnapshot, Password: "task password", PasswordConfirm: "task password",
 		Sources: []model.SourceRoot{{Path: source, Alias: "media"}}, Remote: remote,
 		BlockSize: 1_000_000_000, Retention: 3, Schedule: model.Schedule{Type: model.ScheduleManual},
 	})
@@ -167,7 +167,7 @@ func TestServiceRejectsPathsOutsideConfiguredMappings(t *testing.T) {
 	}
 	defer app.Close()
 	_, err = app.CreateTask(context.Background(), service.CreateTaskInput{
-		Name: "outside", Mode: model.TaskModeSnapshot, Password: "password",
+		Name: "outside", Mode: model.TaskModeSnapshot, Password: "password", PasswordConfirm: "password",
 		Sources:   []model.SourceRoot{{Path: t.TempDir(), Alias: "outside"}},
 		BlockSize: 1_000_000_000, Retention: 3, Schedule: model.Schedule{Type: model.ScheduleManual},
 	})

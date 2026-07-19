@@ -87,6 +87,9 @@ func Scan(ctx context.Context, sources []model.SourceRoot, stablePeriod time.Dur
 		root, _ := filepath.Abs(source.Path)
 		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
+				if errors.Is(walkErr, fs.ErrPermission) {
+					return fmt.Errorf("读取 %q 权限不足；请确认容器 UID:GID、父目录遍历权限和 DSM ACL: %w", path, walkErr)
+				}
 				return fmt.Errorf("read %q: %w", path, walkErr)
 			}
 			if err := ctx.Err(); err != nil {

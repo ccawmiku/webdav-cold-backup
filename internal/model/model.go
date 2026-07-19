@@ -65,6 +65,33 @@ type WebDAVConfig struct {
 	Password string `json:"password,omitempty"`
 }
 
+type RemotePreset struct {
+	ID        string       `json:"id"`
+	Name      string       `json:"name"`
+	Remote    WebDAVConfig `json:"remote"`
+	CreatedAt time.Time    `json:"createdAt"`
+	UpdatedAt time.Time    `json:"updatedAt"`
+}
+
+type PublicRemotePreset struct {
+	ID          string       `json:"id"`
+	Name        string       `json:"name"`
+	Remote      WebDAVConfig `json:"remote"`
+	HasPassword bool         `json:"hasPassword"`
+	CreatedAt   time.Time    `json:"createdAt"`
+	UpdatedAt   time.Time    `json:"updatedAt"`
+}
+
+func (p RemotePreset) Public() PublicRemotePreset {
+	remote := p.Remote
+	hasPassword := remote.Password != ""
+	remote.Password = ""
+	return PublicRemotePreset{
+		ID: p.ID, Name: p.Name, Remote: remote, HasPassword: hasPassword,
+		CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
+	}
+}
+
 type Task struct {
 	ID               string       `json:"id"`
 	Name             string       `json:"name"`
@@ -232,6 +259,21 @@ type RunRecord struct {
 	BytesUploaded int64      `json:"bytesUploaded"`
 	Message       string     `json:"message,omitempty"`
 	Details       []string   `json:"details,omitempty"`
+}
+
+type TaskProgress struct {
+	TaskID           string    `json:"taskId"`
+	Phase            string    `json:"phase"`
+	Percent          float64   `json:"percent"`
+	Message          string    `json:"message"`
+	CurrentFile      string    `json:"currentFile,omitempty"`
+	FilesProcessed   int       `json:"filesProcessed"`
+	FilesTotal       int       `json:"filesTotal"`
+	ObjectsCompleted int       `json:"objectsCompleted"`
+	ObjectsTotal     int       `json:"objectsTotal"`
+	BytesCompleted   int64     `json:"bytesCompleted"`
+	BytesTotal       int64     `json:"bytesTotal"`
+	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
 type GlobalSettings struct {

@@ -36,7 +36,15 @@ import { api, body, formatBytes, formatDate } from '../api'
 import { DirectoryPicker } from '../components/DirectoryPicker'
 import { FileExplorer } from '../components/FileExplorer'
 import { TaskDialog } from '../components/TaskDialog'
-import type { CheckResult, FileEntry, RunRecord, Snapshot, Task, WebDAVConfig } from '../types'
+import type {
+  CheckResult,
+  FileEntry,
+  RunRecord,
+  Snapshot,
+  Task,
+  TaskProgress,
+  WebDAVConfig,
+} from '../types'
 
 interface Props {
   taskId: string
@@ -51,6 +59,7 @@ export function TaskDetail({ taskId, notify, onDeleted }: Props) {
   const [snapshots, setSnapshots] = useState<Snapshot[]>([])
   const [files, setFiles] = useState<FileEntry[]>([])
   const [runs, setRuns] = useState<RunRecord[]>([])
+  const [progress, setProgress] = useState<TaskProgress | null>(null)
   const [snapshotId, setSnapshotId] = useState('')
   const [selected, setSelected] = useState<string[]>([])
   const [tab, setTab] = useState<TabName>('overview')
@@ -71,14 +80,16 @@ export function TaskDetail({ taskId, notify, onDeleted }: Props) {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [loadedTask, loadedSnapshots, loadedRuns] = await Promise.all([
+      const [loadedTask, loadedSnapshots, loadedRuns, loadedProgress] = await Promise.all([
         api<Task>(`/api/tasks/${taskId}`),
         api<Snapshot[]>(`/api/tasks/${taskId}/snapshots`),
         api<RunRecord[]>(`/api/tasks/${taskId}/runs`),
+        api<TaskProgress>(`/api/tasks/${taskId}/progress`),
       ])
       setTask(loadedTask)
       setSnapshots(loadedSnapshots)
       setRuns(loadedRuns)
+      setProgress(loadedProgress)
       setRemote(loadedTask.remote)
       const selectedSnapshot =
         loadedTask.mode === 'archive' ? 'archive' : snapshotId || loadedSnapshots[0]?.id || ''
@@ -100,6 +111,25 @@ export function TaskDetail({ taskId, notify, onDeleted }: Props) {
   useEffect(() => {
     void load()
   }, [load])
+
+  const taskStatus = task?.status
+
+  useEffect(() => {
+    if (!taskStatus || !['queued', 'running', 'paused'].includes(taskStatus)) return
+    const timer = window.setInterval(() => {
+      void Promise.all([
+        api<Task>(`/api/tasks/${taskId}`),
+        api<TaskProgress>(`/api/tasks/${taskId}/progress`),
+      ])
+        .then(([updatedTask, updatedProgress]) => {
+          setTask(updatedTask)
+          setProgress(updatedProgress)
+          if (!['queued', 'running', 'paused'].includes(updatedTask.status)) void load()
+        })
+        .catch(() => undefined)
+    }, 1500)
+    return () => window.clearInterval(timer)
+  }, [load, taskId, taskStatus])
 
   const changeSnapshot = async (id: string) => {
     setSnapshotId(id)
@@ -291,6 +321,7 @@ export function TaskDetail({ taskId, notify, onDeleted }: Props) {
       {tab === 'overview' && (
         <Overview
           task={task}
+          progress={progress}
           snapshots={snapshots}
           runs={runs}
           check={check}
@@ -463,6 +494,7 @@ export function TaskDetail({ taskId, notify, onDeleted }: Props) {
 
 function Overview({
   task,
+  progress,
   snapshots,
   runs,
   check,
@@ -470,6 +502,7 @@ function Overview({
   onCleanup,
 }: {
   task: Task
+  progress: TaskProgress | null
   snapshots: Snapshot[]
   runs: RunRecord[]
   check: CheckResult | null
@@ -480,6 +513,7 @@ function Overview({
   const orphanCount = check?.issues.filter((issue) => issue.kind === 'unreferenced').length ?? 0
   return (
     <Stack spacing={2}>
+      <ProgressDetails task={task} progress={progress} />
       <Box
         sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'repeat(3, 1fr)' }, gap: 2 }}
       >
@@ -530,6 +564,82 @@ function Overview({
         </CardContent>
       </Card>
     </Stack>
+  )
+}
+
+function ProgressDetails({ task, progress }: { task: Task; progress: TaskProgress | null }) {
+  const active = ['queued', 'running', 'paused'].includes(task.status)
+  const percent = Math.max(0, Math.min(100, progress?.percent ?? 0))
+  const phaseLabels: Record<string, string> = {
+    idle: '空闲',
+    queued: '排队中',
+    scanning: '扫描目录',
+    hashing: '比较与计算哈希',
+    uploading: '加密并上传',
+    finalizing: '发布索引',
+    paused: '暂停中',
+    running: '运行中',
+    completed: '已完成',
+    incomplete: '不完整完成',
+    failed: '失败',
+  }
+  return (
+    <Card>
+      <CardContent>
+        <Stack spacing={1.5}>
+          <Stack direction="row" sx={{ justifyContent: 'space-between', gap: 2 }}>
+            <Box>
+              <Typography variant="h6">任务进度</Typography>
+              <Typography color="text.secondary">
+                {phaseLabels[progress?.phase ?? task.status] ?? progress?.phase ?? task.status} ·{' '}
+                {progress?.message ?? '当前没有运行中的备份'}
+              </Typography>
+            </Box>
+            <Typography variant="h5">
+              {active || percent > 0 ? `${percent.toFixed(1)}%` : '—'}
+            </Typography>
+          </Stack>
+          <LinearProgress
+            variant={progress?.phase === 'scanning' ? 'indeterminate' : 'determinate'}
+            value={percent}
+            color={
+              progress?.phase === 'failed'
+                ? 'error'
+                : progress?.phase === 'incomplete'
+                  ? 'warning'
+                  : 'primary'
+            }
+          />
+          <Box
+            sx={{
+              display: 'grid',
+              gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+              gap: 1,
+            }}
+          >
+            <Typography variant="body2">
+              文件：{progress?.filesProcessed ?? 0}/{progress?.filesTotal ?? 0}
+            </Typography>
+            <Typography variant="body2">
+              对象：{progress?.objectsCompleted ?? 0}/{progress?.objectsTotal ?? 0}
+            </Typography>
+            <Typography variant="body2">
+              数据：{formatBytes(progress?.bytesCompleted ?? 0)}/
+              {formatBytes(progress?.bytesTotal ?? 0)}
+            </Typography>
+            <Typography variant="body2">更新：{formatDate(progress?.updatedAt)}</Typography>
+          </Box>
+          {progress?.currentFile && (
+            <Typography
+              variant="body2"
+              sx={{ fontFamily: 'monospace', overflowWrap: 'anywhere', color: 'text.secondary' }}
+            >
+              当前：{progress.currentFile}
+            </Typography>
+          )}
+        </Stack>
+      </CardContent>
+    </Card>
   )
 }
 

@@ -27,6 +27,7 @@
 | GET            | `/api/tasks/{id}/snapshots`                 | 版本和归档索引                               |
 | GET            | `/api/tasks/{id}/files?snapshot=`           | 指定版本文件列表                             |
 | GET            | `/api/tasks/{id}/runs`                      | 最近100次运行记录                            |
+| GET            | `/api/tasks/{id}/progress`                  | 当前阶段、文件、对象和字节进度               |
 | POST           | `/api/tasks/{id}/check`                     | 名称、大小和未引用对象检查                   |
 | POST           | `/api/tasks/{id}/cleanup`                   | 输入任务密码后清理未引用对象                 |
 | POST           | `/api/tasks/{id}/restore`                   | 从WebDAV恢复到NAS映射目录                    |
@@ -37,9 +38,12 @@
 | DELETE         | `/api/tasks/{id}/snapshots/{snapshot}`      | 删除未锁定的整个版本                         |
 | POST           | `/api/remotes/discover`                     | 扫描远端一级任务目录                         |
 | POST           | `/api/remotes/attach`                       | 从远端索引重建本地任务                       |
+| POST           | `/api/remotes/browse`                       | 使用填写或预存凭据浏览远端目录               |
+| GET/POST       | `/api/remote-presets`                       | 列出或保存本地 WebDAV 目标                   |
+| PUT/DELETE     | `/api/remote-presets/{id}`                  | 更新或删除本地 WebDAV 目标                   |
 | GET/PUT        | `/api/settings`                             | 全局并发、限速和时区                         |
 
-任务、WebDAV和删除密码从不出现在响应中。
+任务密码、WebDAV密码和删除密码从不出现在响应中。预存目标列表只返回是否已保存密码。
 
 ## Windows离线端
 

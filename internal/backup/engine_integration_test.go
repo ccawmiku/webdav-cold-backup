@@ -42,11 +42,16 @@ func TestSnapshotBackupIncrementalMoveCopyRestoreAndSalvage(t *testing.T) {
 	}
 	engine := backup.NewEngine(stateStore, cacheRoot, backup.NewControl())
 	engine.RetryDelays = []time.Duration{0}
+	var lastProgress model.TaskProgress
+	engine.Progress = func(progress model.TaskProgress) { lastProgress = progress }
 	settings := model.GlobalSettings{UploadConcurrency: 2, Timezone: "Asia/Singapore"}
 
 	firstRun, err := engine.Run(ctx, task, repo, settings)
 	if err != nil || firstRun.Status != model.RunComplete || firstRun.FilesAdded != 1 {
 		t.Fatalf("first run failed: %+v %v", firstRun, err)
+	}
+	if lastProgress.Phase != "completed" || lastProgress.Percent != 100 || lastProgress.ObjectsTotal == 0 || lastProgress.ObjectsCompleted != lastProgress.ObjectsTotal {
+		t.Fatalf("unexpected completed progress: %+v", lastProgress)
 	}
 	snapshots, _ := stateStore.Snapshots(ctx, task.ID)
 	if len(snapshots) != 1 || len(snapshots[0].Objects) != 1 {

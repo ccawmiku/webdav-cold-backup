@@ -72,6 +72,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("GET /api/tasks/{id}/snapshots", s.snapshots)
 		mux.HandleFunc("GET /api/tasks/{id}/files", s.files)
 		mux.HandleFunc("GET /api/tasks/{id}/runs", s.runs)
+		mux.HandleFunc("GET /api/tasks/{id}/progress", s.progress)
 		mux.HandleFunc("POST /api/tasks/{id}/check", s.quickCheck)
 		mux.HandleFunc("POST /api/tasks/{id}/cleanup", s.cleanup)
 		mux.HandleFunc("POST /api/tasks/{id}/restore", s.restoreTask)
@@ -82,6 +83,11 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("DELETE /api/tasks/{id}/snapshots/{snapshot}", s.deleteSnapshot)
 		mux.HandleFunc("POST /api/remotes/discover", s.discover)
 		mux.HandleFunc("POST /api/remotes/attach", s.attach)
+		mux.HandleFunc("POST /api/remotes/browse", s.browseRemote)
+		mux.HandleFunc("GET /api/remote-presets", s.remotePresets)
+		mux.HandleFunc("POST /api/remote-presets", s.saveRemotePreset)
+		mux.HandleFunc("PUT /api/remote-presets/{id}", s.saveRemotePreset)
+		mux.HandleFunc("DELETE /api/remote-presets/{id}", s.deleteRemotePreset)
 		mux.HandleFunc("GET /api/settings", s.settings)
 		mux.HandleFunc("PUT /api/settings", s.saveSettings)
 	} else {
@@ -214,6 +220,11 @@ func (s *Server) runs(writer http.ResponseWriter, request *http.Request) {
 	respond(writer, items, err)
 }
 
+func (s *Server) progress(writer http.ResponseWriter, request *http.Request) {
+	progress, err := s.service.Progress(request.Context(), request.PathValue("id"))
+	respond(writer, progress, err)
+}
+
 func (s *Server) quickCheck(writer http.ResponseWriter, request *http.Request) {
 	var input struct {
 		SnapshotID string `json:"snapshotId"`
@@ -330,11 +341,11 @@ func (s *Server) deleteSnapshot(writer http.ResponseWriter, request *http.Reques
 }
 
 func (s *Server) discover(writer http.ResponseWriter, request *http.Request) {
-	var remote model.WebDAVConfig
-	if !decode(writer, request, &remote) {
+	var input service.RemoteSelectionInput
+	if !decode(writer, request, &input) {
 		return
 	}
-	items, err := s.service.Discover(request.Context(), remote)
+	items, err := s.service.Discover(request.Context(), input)
 	respond(writer, items, err)
 }
 
@@ -345,6 +356,41 @@ func (s *Server) attach(writer http.ResponseWriter, request *http.Request) {
 	}
 	result, err := s.service.Attach(request.Context(), input)
 	respond(writer, result, err)
+}
+
+func (s *Server) browseRemote(writer http.ResponseWriter, request *http.Request) {
+	var input service.BrowseRemoteInput
+	if !decode(writer, request, &input) {
+		return
+	}
+	items, err := s.service.BrowseRemote(request.Context(), input)
+	respond(writer, items, err)
+}
+
+func (s *Server) remotePresets(writer http.ResponseWriter, request *http.Request) {
+	items, err := s.service.RemotePresets(request.Context())
+	respond(writer, items, err)
+}
+
+func (s *Server) saveRemotePreset(writer http.ResponseWriter, request *http.Request) {
+	var input service.SaveRemotePresetInput
+	if !decode(writer, request, &input) {
+		return
+	}
+	preset, err := s.service.SaveRemotePreset(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	status := http.StatusOK
+	if request.Method == http.MethodPost {
+		status = http.StatusCreated
+	}
+	writeJSON(writer, status, preset)
+}
+
+func (s *Server) deleteRemotePreset(writer http.ResponseWriter, request *http.Request) {
+	respondAction(writer, s.service.DeleteRemotePreset(request.Context(), request.PathValue("id")))
 }
 
 func (s *Server) settings(writer http.ResponseWriter, request *http.Request) {

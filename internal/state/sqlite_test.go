@@ -24,6 +24,21 @@ func TestSQLitePersistsTasksSnapshotsRunsAndSettings(t *testing.T) {
 	if err != nil || loaded.Password != task.Password {
 		t.Fatalf("task mismatch: %+v %v", loaded, err)
 	}
+	preset := model.RemotePreset{
+		ID: "remote", Name: "主网盘",
+		Remote:    model.WebDAVConfig{Endpoint: "http://webdav", Root: "backup", Username: "user", Password: "plain-remote-password"},
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.SaveRemotePreset(ctx, preset); err != nil {
+		t.Fatal(err)
+	}
+	loadedPreset, err := store.RemotePreset(ctx, preset.ID)
+	if err != nil || loadedPreset.Remote.Password != preset.Remote.Password {
+		t.Fatalf("remote preset mismatch: %+v %v", loadedPreset, err)
+	}
+	if presets, _ := store.RemotePresets(ctx); len(presets) != 1 {
+		t.Fatalf("unexpected remote presets: %+v", presets)
+	}
 	snapshot := model.Snapshot{ID: "snapshot", TaskID: task.ID, CreatedAt: now, Complete: true}
 	if err := store.SaveSnapshot(ctx, snapshot); err != nil {
 		t.Fatal(err)
@@ -45,5 +60,8 @@ func TestSQLitePersistsTasksSnapshotsRunsAndSettings(t *testing.T) {
 	}
 	if runs, _ := store.Runs(ctx, task.ID, 100); len(runs) != 1 {
 		t.Fatalf("unexpected runs: %+v", runs)
+	}
+	if err := store.DeleteRemotePreset(ctx, preset.ID); err != nil {
+		t.Fatal(err)
 	}
 }

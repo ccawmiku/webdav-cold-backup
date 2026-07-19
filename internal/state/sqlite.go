@@ -69,6 +69,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			id INTEGER PRIMARY KEY CHECK(id = 1),
 			json BLOB NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS remote_presets (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			json BLOB NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -78,6 +84,65 @@ func (s *Store) migrate(ctx context.Context) error {
 	defaultJSON, _ := json.Marshal(model.DefaultSettings())
 	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO settings(id, json) VALUES(1, ?)`, defaultJSON); err != nil {
 		return fmt.Errorf("initialize settings: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) SaveRemotePreset(ctx context.Context, preset model.RemotePreset) error {
+	encoded, err := json.Marshal(preset)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO remote_presets(id, name, json, updated_at) VALUES(?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET name=excluded.name, json=excluded.json, updated_at=excluded.updated_at`,
+		preset.ID, preset.Name, encoded, preset.UpdatedAt.UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *Store) RemotePreset(ctx context.Context, id string) (model.RemotePreset, error) {
+	var encoded []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT json FROM remote_presets WHERE id=?`, id).Scan(&encoded); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.RemotePreset{}, os.ErrNotExist
+		}
+		return model.RemotePreset{}, err
+	}
+	var preset model.RemotePreset
+	if err := json.Unmarshal(encoded, &preset); err != nil {
+		return model.RemotePreset{}, err
+	}
+	return preset, nil
+}
+
+func (s *Store) RemotePresets(ctx context.Context) ([]model.RemotePreset, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT json FROM remote_presets ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []model.RemotePreset{}
+	for rows.Next() {
+		var encoded []byte
+		if err := rows.Scan(&encoded); err != nil {
+			return nil, err
+		}
+		var preset model.RemotePreset
+		if err := json.Unmarshal(encoded, &preset); err != nil {
+			return nil, err
+		}
+		items = append(items, preset)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) DeleteRemotePreset(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM remote_presets WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		return os.ErrNotExist
 	}
 	return nil
 }

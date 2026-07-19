@@ -28,6 +28,7 @@ type Engine struct {
 	Control     *Control
 	RetryDelays []time.Duration
 	Now         func() time.Time
+	Progress    func(model.TaskProgress)
 }
 
 func NewEngine(store *state.Store, cacheRoot string, control *Control) *Engine {
@@ -50,11 +51,15 @@ type preparedFile struct {
 type buildJob struct {
 	spec    object.BuildSpec
 	fileIDs []string
+	label   string
+	bytes   int64
 }
 
 type jobResult struct {
 	built   object.BuiltObject
 	fileIDs []string
+	label   string
+	bytes   int64
 	err     error
 }
 
@@ -64,6 +69,16 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 		ID: strings.ReplaceAll(uuid.NewString(), "-", ""), TaskID: task.ID,
 		Status: model.RunRunning, StartedAt: now, Details: []string{},
 	}
+	progress := model.TaskProgress{TaskID: task.ID, Phase: "scanning", Percent: 1, Message: "正在扫描源目录"}
+	reportProgress := func(update model.TaskProgress) {
+		update.TaskID = task.ID
+		update.UpdatedAt = e.Now().UTC()
+		progress = update
+		if e.Progress != nil {
+			e.Progress(update)
+		}
+	}
+	reportProgress(progress)
 	_ = e.State.SaveRun(ctx, run)
 	finish := func(status model.RunStatus, message string, runErr error) (model.RunRecord, error) {
 		finished := e.Now().UTC()
@@ -71,6 +86,18 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 		run.Message = message
 		run.FinishedAt = &finished
 		_ = e.State.SaveRun(context.Background(), run)
+		progress.Message = message
+		switch status {
+		case model.RunComplete:
+			progress.Phase = "completed"
+			progress.Percent = 100
+		case model.RunIncomplete:
+			progress.Phase = "incomplete"
+			progress.Percent = 100
+		case model.RunFailed:
+			progress.Phase = "failed"
+		}
+		reportProgress(progress)
 		return run, runErr
 	}
 
@@ -79,6 +106,11 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 		return finish(model.RunFailed, err.Error(), err)
 	}
 	run.FilesScanned = len(scan.Files)
+	progress = model.TaskProgress{
+		TaskID: task.ID, Phase: "hashing", Percent: 10, Message: "正在比较文件并计算新增内容哈希",
+		FilesTotal: len(scan.Files),
+	}
+	reportProgress(progress)
 	if scan.IgnoredSymlinks > 0 {
 		run.Details = append(run.Details, fmt.Sprintf("已忽略%d个符号链接", scan.IgnoredSymlinks))
 	}
@@ -118,7 +150,13 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 	pendingArchiveHashes := make(map[string]struct{})
 	changeCount := 0
 
-	for _, scanned := range scan.Files {
+	for index, scanned := range scan.Files {
+		progress.CurrentFile = displayPath(scanned.RootAlias, scanned.RelativePath)
+		progress.FilesProcessed = index
+		if progress.FilesTotal > 0 {
+			progress.Percent = 10 + 30*float64(index)/float64(progress.FilesTotal)
+		}
+		reportProgress(progress)
 		key := fileKey(scanned.RootAlias, scanned.RelativePath)
 		seenPaths[key] = struct{}{}
 		old, pathExists := byPath[key]
@@ -180,6 +218,10 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 		prepared = append(prepared, item)
 		changeCount++
 	}
+	progress.FilesProcessed = len(scan.Files)
+	progress.CurrentFile = ""
+	progress.Percent = 40
+	reportProgress(progress)
 
 	if task.Mode == model.TaskModeSnapshot {
 		for _, unstable := range scan.UnstableFiles {
@@ -215,11 +257,31 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 	if err != nil {
 		return finish(model.RunFailed, err.Error(), err)
 	}
+	var uploadBytesTotal int64
+	for _, job := range jobs {
+		uploadBytesTotal += job.bytes
+	}
+	progress.Phase = "uploading"
+	progress.Message = "正在加密并上传数据对象"
+	progress.Percent = 45
+	progress.ObjectsTotal = len(jobs)
+	progress.BytesTotal = uploadBytesTotal
+	if len(jobs) > 0 {
+		progress.CurrentFile = jobs[0].label
+	}
+	reportProgress(progress)
 	results := e.executeJobs(ctx, task, repo, settings, jobs)
 	blocksByFile := make(map[string][]model.BlockRef)
 	objects := []model.ObjectRecord{}
 	failedFiles := make(map[string]string)
 	for result := range results {
+		progress.ObjectsCompleted++
+		progress.BytesCompleted += result.bytes
+		progress.CurrentFile = result.label
+		if progress.ObjectsTotal > 0 {
+			progress.Percent = 45 + 45*float64(progress.ObjectsCompleted)/float64(progress.ObjectsTotal)
+		}
+		reportProgress(progress)
 		if result.err != nil {
 			for _, fileID := range result.fileIDs {
 				failedFiles[fileID] = result.err.Error()
@@ -239,6 +301,11 @@ func (e *Engine) Run(ctx context.Context, task model.Task, repo *repository.Repo
 			})
 		}
 	}
+	progress.Phase = "finalizing"
+	progress.Percent = 92
+	progress.Message = "正在发布索引并执行版本保留检查"
+	progress.CurrentFile = ""
+	reportProgress(progress)
 
 	missing := []string{}
 	for _, item := range prepared {
@@ -387,6 +454,19 @@ func (e *Engine) planJobs(task model.Task, key []byte, files []preparedFile) ([]
 		packSize += item.source.Size
 	}
 	flushPack()
+	for index := range jobs {
+		for _, slice := range jobs[index].spec.Slices {
+			jobs[index].bytes += slice.Length
+		}
+		first := jobs[index].spec.Slices[0]
+		jobs[index].label = displayPath(first.File.RootAlias, first.File.RelativePath)
+		if len(jobs[index].spec.Slices) > 1 {
+			jobs[index].label += fmt.Sprintf(" 等%d个文件", len(jobs[index].spec.Slices))
+		}
+		if jobs[index].spec.TotalParts > 1 {
+			jobs[index].label += fmt.Sprintf("（part %d/%d）", jobs[index].spec.Part, jobs[index].spec.TotalParts)
+		}
+	}
 	return jobs, nil
 }
 
@@ -407,7 +487,7 @@ func (e *Engine) executeJobs(ctx context.Context, task model.Task, repo *reposit
 			defer workers.Done()
 			for job := range jobChannel {
 				if err := e.Control.Wait(ctx); err != nil {
-					results <- jobResult{fileIDs: job.fileIDs, err: err}
+					results <- jobResult{fileIDs: job.fileIDs, label: job.label, bytes: job.bytes, err: err}
 					continue
 				}
 				built, err := object.Build(ctx, job.spec)
@@ -420,7 +500,7 @@ func (e *Engine) executeJobs(ctx context.Context, task model.Task, repo *reposit
 				if built.TempPath != "" {
 					_ = os.Remove(built.TempPath)
 				}
-				results <- jobResult{built: built, fileIDs: job.fileIDs, err: err}
+				results <- jobResult{built: built, fileIDs: job.fileIDs, label: job.label, bytes: job.bytes, err: err}
 			}
 		}()
 	}

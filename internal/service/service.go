@@ -36,16 +36,18 @@ type Config struct {
 }
 
 type Service struct {
-	config  Config
-	state   *state.Store
-	engine  *backup.Engine
-	control *backup.Control
-	queue   chan string
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mutex   sync.Mutex
-	queued  map[string]bool
-	current string
+	config        Config
+	state         *state.Store
+	engine        *backup.Engine
+	control       *backup.Control
+	queue         chan string
+	ctx           context.Context
+	cancel        context.CancelFunc
+	mutex         sync.Mutex
+	queued        map[string]bool
+	current       string
+	progressMutex sync.RWMutex
+	progress      map[string]model.TaskProgress
 }
 
 func New(config Config) (*Service, error) {
@@ -63,7 +65,9 @@ func New(config Config) (*Service, error) {
 		config: config, state: store, control: control,
 		engine: backup.NewEngine(store, config.CacheDir, control),
 		queue:  make(chan string, 100), ctx: ctx, cancel: cancel, queued: map[string]bool{},
+		progress: map[string]model.TaskProgress{},
 	}
+	service.engine.Progress = service.setProgress
 	go service.worker()
 	go service.scheduler()
 	return service, nil
@@ -77,14 +81,16 @@ func (s *Service) Close() error {
 func (s *Service) State() *state.Store { return s.state }
 
 type CreateTaskInput struct {
-	Name      string             `json:"name"`
-	Mode      model.TaskMode     `json:"mode"`
-	Password  string             `json:"password"`
-	Sources   []model.SourceRoot `json:"sources"`
-	Remote    model.WebDAVConfig `json:"remote"`
-	BlockSize int64              `json:"blockSize"`
-	Retention int                `json:"retention"`
-	Schedule  model.Schedule     `json:"schedule"`
+	Name            string             `json:"name"`
+	Mode            model.TaskMode     `json:"mode"`
+	Password        string             `json:"password"`
+	PasswordConfirm string             `json:"passwordConfirm"`
+	Sources         []model.SourceRoot `json:"sources"`
+	RemotePresetID  string             `json:"remotePresetId,omitempty"`
+	Remote          model.WebDAVConfig `json:"remote"`
+	BlockSize       int64              `json:"blockSize"`
+	Retention       int                `json:"retention"`
+	Schedule        model.Schedule     `json:"schedule"`
 }
 
 func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (model.PublicTask, error) {
@@ -96,6 +102,9 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (model.
 	}
 	if input.Password == "" {
 		return model.PublicTask{}, errors.New("任务密码不能为空")
+	}
+	if input.Password != input.PasswordConfirm {
+		return model.PublicTask{}, errors.New("两次输入的任务密码不一致")
 	}
 	if _, ok := supportedBlockSizes[input.BlockSize]; !ok {
 		return model.PublicTask{}, errors.New("块容量只能选择1GB、2GB或3.7GB")
@@ -113,6 +122,10 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (model.
 	if err := validateSchedule(input.Schedule); err != nil {
 		return model.PublicTask{}, err
 	}
+	remote, err := s.resolveRemote(ctx, input.RemotePresetID, input.Remote)
+	if err != nil {
+		return model.PublicTask{}, err
+	}
 	salt, err := cryptox.RandomSalt()
 	if err != nil {
 		return model.PublicTask{}, err
@@ -121,7 +134,7 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (model.
 	task := model.Task{
 		ID: strings.ReplaceAll(uuid.NewString(), "-", ""), Name: input.Name,
 		Mode: input.Mode, Password: input.Password, Salt: cryptox.EncodeSalt(salt),
-		Sources: input.Sources, Remote: input.Remote, BlockSize: input.BlockSize,
+		Sources: input.Sources, Remote: remote, BlockSize: input.BlockSize,
 		Retention: input.Retention, Schedule: input.Schedule, Status: model.TaskIdle,
 		CreatedAt: now, UpdatedAt: now, AttachedWritable: true,
 	}
@@ -276,6 +289,7 @@ func (s *Service) Enqueue(ctx context.Context, id string) error {
 	task.Status = model.TaskQueued
 	task.UpdatedAt = time.Now().UTC()
 	_ = s.state.SaveTask(ctx, task)
+	s.setProgress(model.TaskProgress{TaskID: id, Phase: "queued", Percent: 0, Message: "任务已加入串行队列"})
 	select {
 	case s.queue <- id:
 		return nil
@@ -292,6 +306,7 @@ func (s *Service) Pause(ctx context.Context, id string) error {
 		return errors.New("任务当前没有运行")
 	}
 	s.control.Pause()
+	s.updateProgressStatus(id, "paused", "已请求暂停，等待当前对象处理完成")
 	task, err := s.state.Task(ctx, id)
 	if err == nil {
 		task.Status = model.TaskPaused
@@ -309,6 +324,7 @@ func (s *Service) Resume(ctx context.Context, id string) error {
 		return errors.New("任务当前没有暂停")
 	}
 	s.control.Resume()
+	s.updateProgressStatus(id, "running", "任务已继续执行")
 	task, err := s.state.Task(ctx, id)
 	if err == nil {
 		task.Status = model.TaskRunning
@@ -350,6 +366,7 @@ func (s *Service) worker() {
 					task.Status = model.TaskFailed
 					task.UpdatedAt = time.Now().UTC()
 					_ = s.state.SaveTask(context.Background(), task)
+					s.updateProgressStatus(task.ID, "failed", repoErr.Error())
 				}
 			}
 			s.mutex.Lock()
@@ -357,6 +374,42 @@ func (s *Service) worker() {
 			s.mutex.Unlock()
 		}
 	}
+}
+
+func (s *Service) setProgress(progress model.TaskProgress) {
+	progress.UpdatedAt = time.Now().UTC()
+	s.progressMutex.Lock()
+	s.progress[progress.TaskID] = progress
+	s.progressMutex.Unlock()
+}
+
+func (s *Service) updateProgressStatus(taskID, phase, message string) {
+	s.progressMutex.Lock()
+	progress := s.progress[taskID]
+	progress.TaskID = taskID
+	progress.Phase = phase
+	progress.Message = message
+	progress.UpdatedAt = time.Now().UTC()
+	s.progress[taskID] = progress
+	s.progressMutex.Unlock()
+}
+
+func (s *Service) Progress(ctx context.Context, taskID string) (model.TaskProgress, error) {
+	task, err := s.state.Task(ctx, taskID)
+	if err != nil {
+		return model.TaskProgress{}, err
+	}
+	s.progressMutex.RLock()
+	progress, exists := s.progress[taskID]
+	s.progressMutex.RUnlock()
+	if exists {
+		return progress, nil
+	}
+	phase := string(task.Status)
+	if phase == "idle" {
+		phase = "idle"
+	}
+	return model.TaskProgress{TaskID: taskID, Phase: phase, Message: "当前没有运行中的备份", UpdatedAt: task.UpdatedAt}, nil
 }
 
 func (s *Service) scheduler() {
@@ -399,10 +452,11 @@ func (s *Service) scheduleDueTasks() {
 }
 
 type AttachInput struct {
-	Remote   model.WebDAVConfig `json:"remote"`
-	TaskName string             `json:"taskName"`
-	Password string             `json:"password"`
-	Sources  []model.SourceRoot `json:"sources"`
+	RemotePresetID string             `json:"remotePresetId,omitempty"`
+	Remote         model.WebDAVConfig `json:"remote"`
+	TaskName       string             `json:"taskName"`
+	Password       string             `json:"password"`
+	Sources        []model.SourceRoot `json:"sources"`
 }
 
 type AttachResult struct {
@@ -412,7 +466,116 @@ type AttachResult struct {
 	Writable    bool                   `json:"writable"`
 }
 
-func (s *Service) Discover(ctx context.Context, remote model.WebDAVConfig) ([]model.TaskDescriptor, error) {
+type SaveRemotePresetInput struct {
+	Name   string             `json:"name"`
+	Remote model.WebDAVConfig `json:"remote"`
+}
+
+type BrowseRemoteInput struct {
+	RemotePresetID string             `json:"remotePresetId,omitempty"`
+	Remote         model.WebDAVConfig `json:"remote"`
+	Path           string             `json:"path"`
+}
+
+type RemoteDirectory struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+}
+
+func (s *Service) RemotePresets(ctx context.Context) ([]model.PublicRemotePreset, error) {
+	items, err := s.state.RemotePresets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	public := make([]model.PublicRemotePreset, 0, len(items))
+	for _, item := range items {
+		public = append(public, item.Public())
+	}
+	return public, nil
+}
+
+func (s *Service) SaveRemotePreset(ctx context.Context, id string, input SaveRemotePresetInput) (model.PublicRemotePreset, error) {
+	input.Name = strings.TrimSpace(input.Name)
+	if input.Name == "" {
+		return model.PublicRemotePreset{}, errors.New("预存目标名称不能为空")
+	}
+	now := time.Now().UTC()
+	preset := model.RemotePreset{ID: id, Name: input.Name, Remote: input.Remote, CreatedAt: now, UpdatedAt: now}
+	if id == "" {
+		preset.ID = strings.ReplaceAll(uuid.NewString(), "-", "")
+	} else {
+		existing, err := s.state.RemotePreset(ctx, id)
+		if err != nil {
+			return model.PublicRemotePreset{}, err
+		}
+		preset.CreatedAt = existing.CreatedAt
+		if preset.Remote.Password == "" {
+			preset.Remote.Password = existing.Remote.Password
+		}
+	}
+	store, err := storage.NewWebDAVStore(preset.Remote.Endpoint, "", preset.Remote.Username, preset.Remote.Password, nil)
+	if err != nil {
+		return model.PublicRemotePreset{}, err
+	}
+	if _, err := store.List(ctx, preset.Remote.Root); err != nil {
+		return model.PublicRemotePreset{}, fmt.Errorf("验证预存WebDAV目录: %w", err)
+	}
+	if err := s.state.SaveRemotePreset(ctx, preset); err != nil {
+		return model.PublicRemotePreset{}, err
+	}
+	return preset.Public(), nil
+}
+
+func (s *Service) DeleteRemotePreset(ctx context.Context, id string) error {
+	return s.state.DeleteRemotePreset(ctx, id)
+}
+
+func (s *Service) BrowseRemote(ctx context.Context, input BrowseRemoteInput) ([]RemoteDirectory, error) {
+	remote, err := s.resolveRemote(ctx, input.RemotePresetID, input.Remote)
+	if err != nil {
+		return nil, err
+	}
+	store, err := storage.NewWebDAVStore(remote.Endpoint, "", remote.Username, remote.Password, nil)
+	if err != nil {
+		return nil, err
+	}
+	items, err := store.List(ctx, input.Path)
+	if err != nil {
+		return nil, err
+	}
+	directories := []RemoteDirectory{}
+	for _, item := range items {
+		if item.IsDir {
+			directories = append(directories, RemoteDirectory{Path: item.Path, Name: item.Name})
+		}
+	}
+	return directories, nil
+}
+
+func (s *Service) resolveRemote(ctx context.Context, presetID string, remote model.WebDAVConfig) (model.WebDAVConfig, error) {
+	if presetID != "" {
+		preset, err := s.state.RemotePreset(ctx, presetID)
+		if err != nil {
+			return model.WebDAVConfig{}, fmt.Errorf("读取预存WebDAV目标: %w", err)
+		}
+		return preset.Remote, nil
+	}
+	if _, err := storage.NewWebDAVStore(remote.Endpoint, remote.Root, remote.Username, remote.Password, nil); err != nil {
+		return model.WebDAVConfig{}, err
+	}
+	return remote, nil
+}
+
+type RemoteSelectionInput struct {
+	RemotePresetID string             `json:"remotePresetId,omitempty"`
+	Remote         model.WebDAVConfig `json:"remote"`
+}
+
+func (s *Service) Discover(ctx context.Context, input RemoteSelectionInput) ([]model.TaskDescriptor, error) {
+	remote, err := s.resolveRemote(ctx, input.RemotePresetID, input.Remote)
+	if err != nil {
+		return nil, err
+	}
 	task := model.Task{Remote: remote}
 	repo, err := s.repositoryFor(task)
 	if err != nil {
@@ -422,7 +585,11 @@ func (s *Service) Discover(ctx context.Context, remote model.WebDAVConfig) ([]mo
 }
 
 func (s *Service) Attach(ctx context.Context, input AttachInput) (AttachResult, error) {
-	placeholder := model.Task{Remote: input.Remote}
+	remote, err := s.resolveRemote(ctx, input.RemotePresetID, input.Remote)
+	if err != nil {
+		return AttachResult{}, err
+	}
+	placeholder := model.Task{Remote: remote}
 	repo, err := s.repositoryFor(placeholder)
 	if err != nil {
 		return AttachResult{}, err
@@ -446,7 +613,7 @@ func (s *Service) Attach(ctx context.Context, input AttachInput) (AttachResult, 
 	task := model.Task{
 		ID: descriptor.TaskID, Name: descriptor.Name, Mode: descriptor.Mode,
 		Password: input.Password, Salt: descriptor.Salt, Sources: sources,
-		Remote: input.Remote, BlockSize: catalog.BlockSize, Retention: catalog.Retention,
+		Remote: remote, BlockSize: catalog.BlockSize, Retention: catalog.Retention,
 		Schedule: catalog.Schedule, Status: model.TaskReadOnly, CreatedAt: descriptor.CreatedAt,
 		UpdatedAt: now, AttachedWritable: false,
 	}

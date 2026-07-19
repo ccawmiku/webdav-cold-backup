@@ -21,9 +21,10 @@ import {
 } from '@mui/material'
 import { useEffect, useState } from 'react'
 import { api, body } from '../api'
-import type { Schedule, SourceRoot, Task, TaskMode } from '../types'
+import type { Schedule, SourceRoot, Task, TaskMode, WebDAVSelection } from '../types'
 import { DirectoryPicker } from './DirectoryPicker'
 import { ScheduleFields } from './ScheduleFields'
+import { WebDAVTargetPicker } from './WebDAVTargetPicker'
 
 interface Props {
   open: boolean
@@ -38,11 +39,12 @@ export function TaskDialog({ open, onClose, onSaved, task }: Props) {
   const [name, setName] = useState('')
   const [mode, setMode] = useState<TaskMode>('snapshot')
   const [password, setPassword] = useState('')
+  const [passwordConfirm, setPasswordConfirm] = useState('')
   const [sources, setSources] = useState<SourceRoot[]>([{ path: '', alias: '' }])
-  const [endpoint, setEndpoint] = useState('http://')
-  const [remoteRoot, setRemoteRoot] = useState('backup')
-  const [username, setUsername] = useState('')
-  const [remotePassword, setRemotePassword] = useState('')
+  const [webDAV, setWebDAV] = useState<WebDAVSelection>({
+    remotePresetId: '',
+    remote: { endpoint: 'http://', root: '', username: '', password: '' },
+  })
   const [blockSize, setBlockSize] = useState(1_000_000_000)
   const [retention, setRetention] = useState(3)
   const [schedule, setSchedule] = useState<Schedule>(initialSchedule)
@@ -58,11 +60,12 @@ export function TaskDialog({ open, onClose, onSaved, task }: Props) {
     setBlockSize(task?.blockSize ?? 1_000_000_000)
     setRetention(task?.retention ?? 3)
     setSchedule(task?.schedule ?? initialSchedule)
-    setEndpoint(task?.remote.endpoint ?? 'http://')
-    setRemoteRoot(task?.remote.root ?? 'backup')
-    setUsername(task?.remote.username ?? '')
-    setRemotePassword('')
+    setWebDAV({
+      remotePresetId: '',
+      remote: task?.remote ?? { endpoint: 'http://', root: '', username: '', password: '' },
+    })
     setPassword('')
+    setPasswordConfirm('')
     setRunNow(false)
     setError('')
   }, [open, task])
@@ -83,14 +86,17 @@ export function TaskDialog({ open, onClose, onSaved, task }: Props) {
         })
         onSaved(saved, false)
       } else {
+        if (password !== passwordConfirm) throw new Error('两次输入的任务密码不一致')
         const saved = await api<Task>('/api/tasks', {
           method: 'POST',
           ...body({
             name,
             mode,
             password,
+            passwordConfirm,
             sources,
-            remote: { endpoint, root: remoteRoot, username, password: remotePassword },
+            remotePresetId: webDAV.remotePresetId,
+            remote: webDAV.remote,
             blockSize,
             retention,
             schedule,
@@ -133,15 +139,31 @@ export function TaskDialog({ open, onClose, onSaved, task }: Props) {
             </FormControl>
           </Stack>
           {!task && (
-            <TextField
-              required
-              fullWidth
-              label="任务密码"
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              helperText="不限制强度；忘记后无法恢复。密码只明文保存在NAS本地。"
-            />
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <TextField
+                required
+                fullWidth
+                label="任务密码"
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                helperText="忘记后无法恢复；仅明文保存在NAS本地。"
+              />
+              <TextField
+                required
+                fullWidth
+                label="再次输入任务密码"
+                type="password"
+                value={passwordConfirm}
+                error={Boolean(passwordConfirm && password !== passwordConfirm)}
+                helperText={
+                  passwordConfirm && password !== passwordConfirm
+                    ? '两次输入不一致'
+                    : '请再次输入确认'
+                }
+                onChange={(event) => setPasswordConfirm(event.target.value)}
+              />
+            </Stack>
           )}
           <Box>
             <Typography variant="subtitle1" sx={{ fontWeight: 700 }} gutterBottom>
@@ -194,35 +216,7 @@ export function TaskDialog({ open, onClose, onSaved, task }: Props) {
               <Typography variant="subtitle1" sx={{ fontWeight: 700 }} gutterBottom>
                 WebDAV目标
               </Typography>
-              <Stack spacing={2}>
-                <TextField
-                  required
-                  label="WebDAV地址"
-                  value={endpoint}
-                  onChange={(event) => setEndpoint(event.target.value)}
-                  placeholder="http://nas:5005/webdav"
-                />
-                <TextField
-                  label="备份根目录"
-                  value={remoteRoot}
-                  onChange={(event) => setRemoteRoot(event.target.value)}
-                />
-                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
-                  <TextField
-                    fullWidth
-                    label="用户名"
-                    value={username}
-                    onChange={(event) => setUsername(event.target.value)}
-                  />
-                  <TextField
-                    fullWidth
-                    label="WebDAV密码"
-                    type="password"
-                    value={remotePassword}
-                    onChange={(event) => setRemotePassword(event.target.value)}
-                  />
-                </Stack>
-              </Stack>
+              <WebDAVTargetPicker value={webDAV} onChange={setWebDAV} disabled={saving} />
             </Box>
           )}
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
@@ -260,7 +254,11 @@ export function TaskDialog({ open, onClose, onSaved, task }: Props) {
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose}>取消</Button>
-        <Button variant="contained" disabled={saving} onClick={() => void save()}>
+        <Button
+          variant="contained"
+          disabled={saving || (!task && (!password || password !== passwordConfirm))}
+          onClick={() => void save()}
+        >
           {saving ? '正在验证并保存…' : '保存'}
         </Button>
       </DialogActions>

@@ -21,6 +21,25 @@ export interface WebDAVConfig {
   password?: string
 }
 
+export interface RemotePreset {
+  id: string
+  name: string
+  remote: WebDAVConfig
+  hasPassword: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WebDAVSelection {
+  remotePresetId: string
+  remote: WebDAVConfig
+}
+
+export interface RemoteDirectory {
+  path: string
+  name: string
+}
+
 export interface Task {
   id: string
   name: string
@@ -78,6 +97,21 @@ export interface RunRecord {
   bytesUploaded: number
   message?: string
   details?: string[]
+}
+
+export interface TaskProgress {
+  taskId: string
+  phase: string
+  percent: number
+  message: string
+  currentFile?: string
+  filesProcessed: number
+  filesTotal: number
+  objectsCompleted: number
+  objectsTotal: number
+  bytesCompleted: number
+  bytesTotal: number
+  updatedAt: string
 }
 
 export interface Settings {

@@ -3,8 +3,8 @@ services:
     image: ghcr.io/ccawmiku/webdav-cold-backup:v1.0.0
     container_name: webdav-cold-backup
     restart: unless-stopped
-    # 群晖管理员账号的 UID:GID；1026:101 是常见值，不同设备请按实际值修改。
-    user: "1026:101"
+    # 当前群晖管理员账号的实际 UID:GID。
+    user: "1026:100"
     ports:
       - "19001:8080"
     environment:
