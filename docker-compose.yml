@@ -3,9 +3,10 @@ services:
     image: ghcr.io/ccawmiku/webdav-cold-backup:v1.0.0
     container_name: webdav-cold-backup
     restart: unless-stopped
-    user: "${WCB_UID:-65532}:${WCB_GID:-65532}"
+    # 群晖管理员账号的 UID:GID；1026:101 是常见值，不同设备请按实际值修改。
+    user: "1026:101"
     ports:
-      - "${WCB_PORT:-8080}:8080"
+      - "19001:8080"
     environment:
       WCB_LISTEN_ADDR: 0.0.0.0:8080
       WCB_CONFIG_DIR: /config
@@ -13,7 +14,7 @@ services:
       WCB_SOURCE_ROOT: /sources
       WCB_RESTORE_ROOT: /restore
     volumes:
-      - ${WCB_CONFIG_PATH:-./data/config}:/config
-      - ${WCB_CACHE_PATH:-./data/cache}:/cache
-      - ${WCB_SOURCE_PATH:-./data/sources}:/sources:ro
-      - ${WCB_RESTORE_PATH:-./data/restore}:/restore
+      - /volume1/docker/webdav-cold-backup/config:/config
+      - /volume1/docker/webdav-cold-backup/cache:/cache
+      - /volume1:/sources:ro
+      - /volume1/docker/webdav-cold-backup/restore:/restore
