@@ -95,6 +95,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/offline/select", s.offlineSelect)
 		mux.HandleFunc("GET /api/offline/files", s.offlineFiles)
 		mux.HandleFunc("POST /api/offline/restore", s.offlineRestore)
+		mux.HandleFunc("GET /api/offline/progress", s.offlineProgress)
 	}
 	mux.Handle("/", webui.Handler())
 	return recoverMiddleware(loggingHeaders(mux))
@@ -444,6 +445,10 @@ func (s *Server) offlineRestore(writer http.ResponseWriter, request *http.Reques
 	}
 	report, err := s.offline.Restore(request.Context(), input.Selected, input.Output)
 	respond(writer, report, err)
+}
+
+func (s *Server) offlineProgress(writer http.ResponseWriter, _ *http.Request) {
+	writeJSON(writer, http.StatusOK, s.offline.RestoreProgress())
 }
 
 type fsItem struct {

@@ -16,11 +16,11 @@ import {
   TextField,
   Typography,
 } from '@mui/material'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api, body, formatBytes, formatDate } from '../api'
 import { DirectoryPicker } from '../components/DirectoryPicker'
 import { FileExplorer } from '../components/FileExplorer'
-import type { FileEntry, OfflineOpenResult } from '../types'
+import type { FileEntry, OfflineOpenResult, RestoreProgress } from '../types'
 
 interface Props {
   notify: (message: string, severity?: 'success' | 'error' | 'warning') => void
@@ -35,6 +35,27 @@ export function OfflinePage({ notify }: Props) {
   const [selected, setSelected] = useState<string[]>([])
   const [output, setOutput] = useState('')
   const [busy, setBusy] = useState(false)
+  const [restoring, setRestoring] = useState(false)
+  const [restoreProgress, setRestoreProgress] = useState<RestoreProgress | null>(null)
+
+  useEffect(() => {
+    if (!restoring) return
+    let active = true
+    const refresh = async () => {
+      try {
+        const progress = await api<RestoreProgress>('/api/offline/progress')
+        if (active) setRestoreProgress(progress)
+      } catch {
+        // 恢复请求本身会报告错误；短暂轮询失败不打断恢复。
+      }
+    }
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 750)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [restoring])
 
   const open = async () => {
     setBusy(true)
@@ -74,23 +95,35 @@ export function OfflinePage({ notify }: Props) {
 
   const restore = async () => {
     setBusy(true)
+    setRestoring(true)
+    setRestoreProgress(null)
     try {
-      const report = await api<{ results: Array<{ status: string }> }>('/api/offline/restore', {
-        method: 'POST',
-        ...body({ selected, output }),
-      })
+      const report = await api<{ results: Array<{ status: string; verified: boolean }> }>(
+        '/api/offline/restore',
+        {
+          method: 'POST',
+          ...body({ selected, output }),
+        },
+      )
       const failures = report.results.filter((result) =>
         ['failed', 'missing', 'invalid'].includes(result.status),
       ).length
+      const verified = report.results.filter((result) => result.verified).length
       notify(
         failures
-          ? `恢复完成，${failures}个文件未恢复；报告已写入目标目录`
-          : '恢复完成，HTML和JSON报告已写入目标目录',
+          ? `恢复完成，已哈希核验${verified}个文件，${failures}个文件未恢复；报告已写入目标目录`
+          : `恢复完成，${verified}个文件通过SHA-256核验；HTML和JSON报告已写入目标目录`,
         failures ? 'warning' : 'success',
       )
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : '恢复失败', 'error')
     } finally {
+      try {
+        setRestoreProgress(await api<RestoreProgress>('/api/offline/progress'))
+      } catch {
+        // 保留最后一次成功轮询的进度。
+      }
+      setRestoring(false)
       setBusy(false)
     }
   }
@@ -116,7 +149,10 @@ export function OfflinePage({ notify }: Props) {
               完全离线运行，不连接WebDAV。选择已经完整下载的任务目录，输入任务密码后恢复全部或部分文件。
             </Typography>
           </Box>
-          {busy && <LinearProgress />}
+          {busy && !restoring && <LinearProgress />}
+          {restoreProgress && restoreProgress.status !== 'idle' && (
+            <RestoreProgressCard progress={restoreProgress} />
+          )}
           <Card>
             <CardContent>
               <Stack spacing={2}>
@@ -222,6 +258,100 @@ export function OfflinePage({ notify }: Props) {
           )}
         </Stack>
       </Box>
+    </Box>
+  )
+}
+
+function RestoreProgressCard({ progress }: { progress: RestoreProgress }) {
+  const phaseNames: Record<string, string> = {
+    queued: '准备恢复',
+    preflight: '预检对象',
+    preparing: '准备路径',
+    restoring: '解密写入',
+    verifying: '哈希核验',
+    completed: '恢复完成',
+    failed: '恢复失败',
+  }
+  const color =
+    progress.status === 'failed' ? 'error' : progress.status === 'completed' ? 'success' : 'primary'
+  return (
+    <Card>
+      <CardContent>
+        <Stack spacing={2}>
+          <Stack direction="row" sx={{ justifyContent: 'space-between', gap: 2 }}>
+            <Box>
+              <Typography variant="h6">
+                恢复进度 · {phaseNames[progress.phase] ?? progress.phase}
+              </Typography>
+              <Typography color="text.secondary">{progress.error || progress.message}</Typography>
+            </Box>
+            <Typography variant="h5" sx={{ fontWeight: 800 }}>
+              {Math.max(0, Math.min(100, progress.percent)).toFixed(1)}%
+            </Typography>
+          </Stack>
+          <LinearProgress
+            variant="determinate"
+            value={Math.max(0, Math.min(100, progress.percent))}
+            color={color}
+            sx={{ height: 10, borderRadius: 5 }}
+          />
+          <Box
+            sx={{
+              display: 'grid',
+              gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4,1fr)' },
+              gap: 1.5,
+            }}
+          >
+            <ProgressMetric
+              label="文件"
+              value={`${progress.filesCompleted}/${progress.filesTotal}`}
+            />
+            <ProgressMetric
+              label="对象核对"
+              value={`${progress.objectsChecked}/${progress.objectsCheckTotal}`}
+            />
+            <ProgressMetric
+              label="对象读取"
+              value={`${progress.objectsCompleted}/${progress.objectsTotal}`}
+            />
+            <ProgressMetric
+              label="恢复数据"
+              value={`${formatBytes(progress.bytesCompleted)}/${formatBytes(progress.bytesTotal)}`}
+            />
+            <ProgressMetric
+              label="哈希数据"
+              value={`${formatBytes(progress.verifyBytesCompleted)}/${formatBytes(progress.verifyBytesTotal)}`}
+            />
+            <ProgressMetric label="核验通过" value={`${progress.verifiedFiles}`} />
+            <ProgressMetric label="已恢复" value={`${progress.restoredFiles}`} />
+            <ProgressMetric
+              label="跳过 / 失败"
+              value={`${progress.skippedFiles} / ${progress.failedFiles}`}
+            />
+          </Box>
+          {progress.currentObject && (
+            <Typography variant="body2" sx={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>
+              当前对象：{progress.currentObject}
+            </Typography>
+          )}
+          {progress.currentFile && (
+            <Typography variant="body2" sx={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>
+              当前文件：{progress.currentFile}
+            </Typography>
+          )}
+        </Stack>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ProgressMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <Box sx={{ p: 1.25, borderRadius: 1, bgcolor: 'action.hover' }}>
+      <Typography variant="caption" color="text.secondary">
+        {label}
+      </Typography>
+      <Typography sx={{ fontWeight: 700 }}>{value}</Typography>
     </Box>
   )
 }

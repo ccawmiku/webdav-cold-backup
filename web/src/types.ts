@@ -157,3 +157,28 @@ export interface OfflineOpenResult {
   selected: string
   salvaged: boolean
 }
+
+export interface RestoreProgress {
+  status: 'idle' | 'queued' | 'running' | 'completed' | 'failed'
+  phase: string
+  percent: number
+  message: string
+  currentObject?: string
+  currentFile?: string
+  filesCompleted: number
+  filesTotal: number
+  objectsChecked: number
+  objectsCheckTotal: number
+  objectsCompleted: number
+  objectsTotal: number
+  bytesCompleted: number
+  bytesTotal: number
+  verifyBytesCompleted: number
+  verifyBytesTotal: number
+  restoredFiles: number
+  skippedFiles: number
+  failedFiles: number
+  verifiedFiles: number
+  error?: string
+  updatedAt: string
+}

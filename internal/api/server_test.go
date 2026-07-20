@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ccawmiku/webdav-cold-backup/internal/api"
+	"github.com/ccawmiku/webdav-cold-backup/internal/offline"
 	"github.com/ccawmiku/webdav-cold-backup/internal/service"
 	"github.com/ccawmiku/webdav-cold-backup/internal/testutil"
 )
@@ -104,6 +105,15 @@ func TestServerRuntimeTaskCreationAndSecretRedaction(t *testing.T) {
 	handler.ServeHTTP(listRecorder, httptest.NewRequest(http.MethodGet, "/api/tasks", nil))
 	if listRecorder.Code != http.StatusOK || !strings.Contains(listRecorder.Body.String(), "api-task") {
 		t.Fatalf("task list failed: %d %s", listRecorder.Code, listRecorder.Body.String())
+	}
+}
+
+func TestOfflineRestoreProgressStartsIdle(t *testing.T) {
+	handler := api.NewOffline(&offline.Session{})
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/offline/progress", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"status":"idle"`) || !strings.Contains(recorder.Body.String(), `"phase":"idle"`) {
+		t.Fatalf("unexpected offline progress response: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 

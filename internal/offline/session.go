@@ -31,6 +31,8 @@ type Session struct {
 	selectedID string
 	repository *repository.Repository
 	salvaged   bool
+	restoring  bool
+	progress   restore.Progress
 }
 
 type OpenResult struct {
@@ -150,20 +152,49 @@ func (s *Session) Files() ([]model.FileEntry, error) {
 }
 
 func (s *Session) Restore(ctx context.Context, selected []string, output string) (restore.Report, error) {
-	s.mutex.RLock()
+	s.mutex.Lock()
+	if s.restoring {
+		s.mutex.Unlock()
+		return restore.Report{}, errors.New("已有恢复任务正在运行")
+	}
 	task := s.task
 	snapshot, exists := s.snapshots[s.selectedID]
 	repo := s.repository
-	s.mutex.RUnlock()
 	if !exists || repo == nil {
+		s.mutex.Unlock()
 		return restore.Report{}, errors.New("尚未打开任务")
 	}
-	engine := restore.Engine{Repository: repo}
+	s.restoring = true
+	s.progress = restore.Progress{Status: "running", Phase: "queued", Percent: 0, Message: "恢复任务已开始", UpdatedAt: time.Now().UTC()}
+	s.mutex.Unlock()
+	defer func() {
+		s.mutex.Lock()
+		s.restoring = false
+		s.mutex.Unlock()
+	}()
+	engine := restore.Engine{Repository: repo, Progress: func(progress restore.Progress) {
+		s.mutex.Lock()
+		s.progress = progress
+		s.mutex.Unlock()
+	}}
 	report, err := engine.Restore(ctx, task, snapshot, selected, output)
 	if err == nil {
 		_, _, _ = restore.WriteReport(output, report)
 	}
 	return report, err
+}
+
+func (s *Session) RestoreProgress() restore.Progress {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	progress := s.progress
+	if progress.Status == "" {
+		progress.Status = "idle"
+		progress.Phase = "idle"
+		progress.Message = "尚未开始恢复"
+		progress.UpdatedAt = time.Now().UTC()
+	}
+	return progress
 }
 
 func Salvage(ctx context.Context, taskDirectory, password string) (model.Task, model.Snapshot, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,14 +100,32 @@ func TestSnapshotBackupIncrementalMoveCopyRestoreAndSalvage(t *testing.T) {
 	}
 
 	output := t.TempDir()
-	restoreEngine := restore.Engine{Repository: repo}
+	var restoreProgress restore.Progress
+	restoreEngine := restore.Engine{Repository: repo, Progress: func(progress restore.Progress) {
+		restoreProgress = progress
+	}}
 	report, err := restoreEngine.Restore(ctx, task, firstSnapshot, nil, output)
-	if err != nil || len(report.Results) != 1 || report.Results[0].Status != restore.StatusRestored {
+	if err != nil || len(report.Results) != 1 || report.Results[0].Status != restore.StatusRestored || !report.Results[0].Verified {
 		t.Fatalf("restore failed: %+v %v", report, err)
+	}
+	if restoreProgress.Status != "completed" || restoreProgress.Phase != "completed" || restoreProgress.Percent != 100 || restoreProgress.VerifiedFiles != 1 {
+		t.Fatalf("unexpected restore progress: %+v", restoreProgress)
 	}
 	restored, err := os.ReadFile(filepath.Join(output, "media", "video.mp4"))
 	if err != nil || string(restored) != "test video payload" {
 		t.Fatalf("restored content mismatch: %q %v", restored, err)
+	}
+
+	tamperedSnapshot := firstSnapshot
+	tamperedSnapshot.Files = append([]model.FileEntry(nil), firstSnapshot.Files...)
+	tamperedSnapshot.Files[0].Hash = strings.Repeat("0", 64)
+	tamperedOutput := t.TempDir()
+	tamperedReport, err := restoreEngine.Restore(ctx, task, tamperedSnapshot, nil, tamperedOutput)
+	if err != nil || len(tamperedReport.Results) != 1 || tamperedReport.Results[0].Status != restore.StatusFailed || tamperedReport.Results[0].Verified {
+		t.Fatalf("hash mismatch was not rejected: %+v %v", tamperedReport, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(tamperedOutput, "media", "video.mp4")); !os.IsNotExist(statErr) {
+		t.Fatalf("hash-mismatched output should not be published: %v", statErr)
 	}
 
 	salvagedTask, salvaged, err := offline.Salvage(ctx, filepath.Join(remoteRoot, task.Name), task.Password)

@@ -39,6 +39,7 @@ type FileResult struct {
 	OutputPath   string     `json:"outputPath,omitempty"`
 	Status       FileStatus `json:"status"`
 	Message      string     `json:"message,omitempty"`
+	Verified     bool       `json:"verified"`
 }
 
 type Report struct {
@@ -64,8 +65,74 @@ type PlanObject struct {
 	Hash string `json:"hash"`
 }
 
+type Progress struct {
+	Status               string    `json:"status"`
+	Phase                string    `json:"phase"`
+	Percent              float64   `json:"percent"`
+	Message              string    `json:"message"`
+	CurrentObject        string    `json:"currentObject,omitempty"`
+	CurrentFile          string    `json:"currentFile,omitempty"`
+	FilesCompleted       int       `json:"filesCompleted"`
+	FilesTotal           int       `json:"filesTotal"`
+	ObjectsChecked       int       `json:"objectsChecked"`
+	ObjectsCheckTotal    int       `json:"objectsCheckTotal"`
+	ObjectsCompleted     int       `json:"objectsCompleted"`
+	ObjectsTotal         int       `json:"objectsTotal"`
+	BytesCompleted       int64     `json:"bytesCompleted"`
+	BytesTotal           int64     `json:"bytesTotal"`
+	VerifyBytesCompleted int64     `json:"verifyBytesCompleted"`
+	VerifyBytesTotal     int64     `json:"verifyBytesTotal"`
+	RestoredFiles        int       `json:"restoredFiles"`
+	SkippedFiles         int       `json:"skippedFiles"`
+	FailedFiles          int       `json:"failedFiles"`
+	VerifiedFiles        int       `json:"verifiedFiles"`
+	Error                string    `json:"error,omitempty"`
+	UpdatedAt            time.Time `json:"updatedAt"`
+}
+
 type Engine struct {
 	Repository *repository.Repository
+	Progress   func(Progress)
+}
+
+type progressEmitter struct {
+	callback func(Progress)
+	last     time.Time
+}
+
+func (e *progressEmitter) emit(progress *Progress, force bool) {
+	if e.callback == nil {
+		return
+	}
+	now := time.Now().UTC()
+	if !force && !e.last.IsZero() && now.Sub(e.last) < 200*time.Millisecond {
+		return
+	}
+	progress.UpdatedAt = now
+	e.last = now
+	e.callback(*progress)
+}
+
+func restoreTotals(snapshot model.Snapshot, selected []string) (int, map[string]int64, int64) {
+	selection := selectionMap(selected)
+	objects := map[string]int64{}
+	files := 0
+	var verifyBytes int64
+	for _, file := range snapshot.Files {
+		key := fileKey(file.RootAlias, file.RelativePath)
+		if !selectedFile(selection, key) {
+			continue
+		}
+		files++
+		if file.MissingReason != "" {
+			continue
+		}
+		verifyBytes += file.Size
+		for _, block := range file.Blocks {
+			objects[block.ObjectPath] = block.ObjectSize
+		}
+	}
+	return files, objects, verifyBytes
 }
 
 func (e *Engine) BuildPlan(task model.Task, snapshot model.Snapshot, selected []string) Plan {
@@ -92,6 +159,10 @@ func (e *Engine) BuildPlan(task model.Task, snapshot model.Snapshot, selected []
 }
 
 func (e *Engine) Preflight(ctx context.Context, task model.Task, snapshot model.Snapshot, selected []string) []FileResult {
+	return e.preflight(ctx, task, snapshot, selected, nil)
+}
+
+func (e *Engine) preflight(ctx context.Context, task model.Task, snapshot model.Snapshot, selected []string, onObject func(string)) []FileResult {
 	selection := selectionMap(selected)
 	results := []FileResult{}
 	objectStatus := map[string]error{}
@@ -110,6 +181,9 @@ func (e *Engine) Preflight(ctx context.Context, task model.Task, snapshot model.
 		for _, block := range file.Blocks {
 			err, checked := objectStatus[block.ObjectPath]
 			if !checked {
+				if onObject != nil {
+					onObject(block.ObjectPath)
+				}
 				info, statErr := e.Repository.StatObject(ctx, task.Name, block.ObjectPath)
 				if statErr == nil && info.Size != block.ObjectSize {
 					statErr = fmt.Errorf("对象大小应为%d，实际为%d", block.ObjectSize, info.Size)
@@ -128,9 +202,44 @@ func (e *Engine) Preflight(ctx context.Context, task model.Task, snapshot model.
 	return results
 }
 
-func (e *Engine) Restore(ctx context.Context, task model.Task, snapshot model.Snapshot, selected []string, outputRoot string) (Report, error) {
-	report := Report{StartedAt: time.Now().UTC(), SnapshotID: snapshot.ID, Results: e.Preflight(ctx, task, snapshot, selected)}
-	defer func() { report.FinishedAt = time.Now().UTC() }()
+func (e *Engine) Restore(ctx context.Context, task model.Task, snapshot model.Snapshot, selected []string, outputRoot string) (report Report, finalErr error) {
+	startedAt := time.Now().UTC()
+	fileTotal, objectSizes, verifyBytesTotal := restoreTotals(snapshot, selected)
+	var bytesTotal int64
+	for _, size := range objectSizes {
+		bytesTotal += size
+	}
+	progress := Progress{
+		Status: "running", Phase: "preflight", Percent: 1, Message: "正在核对恢复索引和数据对象",
+		FilesTotal: fileTotal, ObjectsCheckTotal: len(objectSizes), ObjectsTotal: len(objectSizes), BytesTotal: bytesTotal,
+		VerifyBytesTotal: verifyBytesTotal, UpdatedAt: startedAt,
+	}
+	emitter := progressEmitter{callback: e.Progress}
+	emitter.emit(&progress, true)
+	defer func() {
+		report.FinishedAt = time.Now().UTC()
+		if finalErr != nil {
+			progress.Status = "failed"
+			progress.Phase = "failed"
+			progress.Message = "恢复失败"
+			progress.Error = finalErr.Error()
+			updateProgressCounts(&progress, report.Results)
+			emitter.emit(&progress, true)
+		}
+	}()
+	report = Report{StartedAt: startedAt, SnapshotID: snapshot.ID}
+	report.Results = e.preflight(ctx, task, snapshot, selected, func(objectPath string) {
+		progress.CurrentObject = objectPath
+		progress.ObjectsChecked++
+		if progress.ObjectsCheckTotal > 0 {
+			progress.Percent = 1 + 9*float64(progress.ObjectsChecked)/float64(progress.ObjectsCheckTotal)
+		}
+		emitter.emit(&progress, false)
+	})
+	progress.CurrentObject = ""
+	progress.FilesTotal = len(report.Results)
+	updateProgressCounts(&progress, report.Results)
+	emitter.emit(&progress, true)
 	if err := ensureOutputRoot(outputRoot); err != nil {
 		return report, err
 	}
@@ -143,6 +252,10 @@ func (e *Engine) Restore(ctx context.Context, task model.Task, snapshot model.Sn
 		return report, err
 	}
 
+	progress.Phase = "preparing"
+	progress.Percent = 10
+	progress.Message = "正在准备恢复路径并核对已有文件"
+	emitter.emit(&progress, true)
 	entries := map[string]model.FileEntry{}
 	states := map[string]*outputState{}
 	casePaths := map[string]string{}
@@ -160,33 +273,50 @@ func (e *Engine) Restore(ctx context.Context, task model.Task, snapshot model.Sn
 		if runtime.GOOS == "windows" && !validWindowsPath(entry.RootAlias, entry.RelativePath) {
 			result.Status = StatusInvalid
 			result.Message = "Windows不支持该文件名"
+			updateProgressCounts(&progress, report.Results)
 			continue
 		}
-		target, conflict, targetErr := chooseTarget(outputRoot, entry, casePaths)
+		progress.CurrentFile = fileKey(entry.RootAlias, entry.RelativePath)
+		var existingHashBytes int64
+		target, conflict, targetErr := chooseTargetWithProgress(outputRoot, entry, casePaths, func(count int64) {
+			existingHashBytes += count
+			progress.VerifyBytesCompleted += count
+			progress.Message = "正在哈希核对已有文件"
+			emitter.emit(&progress, false)
+		})
 		if targetErr != nil {
 			result.Status = StatusFailed
 			result.Message = targetErr.Error()
+			updateProgressCounts(&progress, report.Results)
 			continue
 		}
 		if conflict == existingSame {
 			result.Status = StatusSkipped
 			result.OutputPath = target
+			result.Verified = true
 			_ = fsmeta.SetTimes(target, entry.Times.Created, entry.Times.Modified)
+			updateProgressCounts(&progress, report.Results)
+			emitter.emit(&progress, true)
 			continue
 		}
 		if conflict == existingDifferent {
 			result.Status = StatusConflict
+			if existingHashBytes > 0 {
+				progress.VerifyBytesTotal += entry.Size
+			}
 		}
 		result.OutputPath = target
 		temp := target + ".wcb-restore.partial"
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			result.Status = StatusFailed
 			result.Message = err.Error()
+			updateProgressCounts(&progress, report.Results)
 			continue
 		}
 		if err := os.Remove(temp); err != nil && !os.IsNotExist(err) {
 			result.Status = StatusFailed
 			result.Message = err.Error()
+			updateProgressCounts(&progress, report.Results)
 			continue
 		}
 		entries[entry.ID] = entry
@@ -205,64 +335,145 @@ func (e *Engine) Restore(ctx context.Context, task model.Task, snapshot model.Sn
 		objectPaths = append(objectPaths, objectPath)
 	}
 	sort.Strings(objectPaths)
+	progress.Phase = "restoring"
+	progress.Percent = 15
+	progress.Message = "正在解密并写入恢复文件"
+	progress.CurrentFile = ""
+	progress.ObjectsTotal = len(objectPaths)
+	progress.BytesTotal = 0
+	for _, objectPath := range objectPaths {
+		progress.BytesTotal += objectSizes[objectPath]
+	}
+	emitter.emit(&progress, true)
+	var completedObjectBytes int64
+	completeObject := func(objectPath string) {
+		completedObjectBytes += objectSizes[objectPath]
+		progress.BytesCompleted = completedObjectBytes
+		progress.ObjectsCompleted++
+		if progress.BytesTotal > 0 {
+			progress.Percent = 15 + 70*float64(progress.BytesCompleted)/float64(progress.BytesTotal)
+		}
+		updateProgressCounts(&progress, report.Results)
+		emitter.emit(&progress, true)
+	}
 	for _, objectPath := range objectPaths {
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
+		progress.CurrentObject = objectPath
+		progress.Message = "正在读取并解密数据对象"
+		emitter.emit(&progress, true)
 		reader, openErr := e.Repository.OpenObject(ctx, task.Name, objectPath)
 		if openErr != nil {
 			markFailed(report.Results, objectFiles[objectPath], openErr.Error())
+			completeObject(objectPath)
 			continue
 		}
 		objectReader, decryptErr := cryptox.OpenObjectWithKey(reader, key)
 		if decryptErr != nil {
 			_ = reader.Close()
 			markFailed(report.Results, objectFiles[objectPath], decryptErr.Error())
+			completeObject(objectPath)
 			continue
 		}
 		var metadata model.ObjectPayloadMetadata
 		if err := json.Unmarshal(objectReader.Metadata, &metadata); err != nil {
 			_ = reader.Close()
 			markFailed(report.Results, objectFiles[objectPath], err.Error())
+			completeObject(objectPath)
 			continue
 		}
-		writeErr := extractSelected(objectReader.Payload, metadata, states)
+		objectSize := objectSizes[objectPath]
+		var currentObjectBytes int64
+		payload := &countingReader{reader: objectReader.Payload, onRead: func(count int64) {
+			currentObjectBytes += count
+			progress.BytesCompleted = completedObjectBytes + min(currentObjectBytes, objectSize)
+			if progress.BytesTotal > 0 {
+				progress.Percent = 15 + 70*float64(progress.BytesCompleted)/float64(progress.BytesTotal)
+			}
+			emitter.emit(&progress, false)
+		}}
+		writeErr := extractSelected(payload, metadata, states, func(record model.PayloadFileRecord) {
+			progress.CurrentFile = fileKey(record.RootAlias, record.RelativePath)
+			emitter.emit(&progress, false)
+		})
 		_ = reader.Close()
 		if writeErr != nil {
 			markFailed(report.Results, objectFiles[objectPath], writeErr.Error())
 		}
+		completeObject(objectPath)
 	}
 
-	for fileID, state := range states {
+	progress.Phase = "verifying"
+	progress.Percent = 85
+	progress.Message = "正在对恢复结果执行SHA-256核验"
+	progress.CurrentObject = ""
+	emitter.emit(&progress, true)
+	fileIDs := make([]string, 0, len(states))
+	for fileID := range states {
+		fileIDs = append(fileIDs, fileID)
+	}
+	sort.Slice(fileIDs, func(i, j int) bool {
+		left, right := entries[fileIDs[i]], entries[fileIDs[j]]
+		return fileKey(left.RootAlias, left.RelativePath) < fileKey(right.RootAlias, right.RelativePath)
+	})
+	for _, fileID := range fileIDs {
+		state := states[fileID]
 		entry := entries[fileID]
 		result := findResult(report.Results, entry.RootAlias, entry.RelativePath)
+		progress.CurrentFile = fileKey(entry.RootAlias, entry.RelativePath)
 		if result == nil || result.Status == StatusFailed {
 			_ = os.Remove(state.tempPath)
+			updateProgressCounts(&progress, report.Results)
 			continue
 		}
 		if state.written != entry.Size {
 			result.Status = StatusFailed
 			result.Message = fmt.Sprintf("恢复字节数不完整：需要%d，实际%d", entry.Size, state.written)
 			_ = os.Remove(state.tempPath)
+			updateProgressCounts(&progress, report.Results)
+			emitter.emit(&progress, true)
 			continue
 		}
-		hash, hashErr := hashFile(state.tempPath)
+		hash, hashErr := hashFileWithProgress(state.tempPath, func(count int64) {
+			progress.VerifyBytesCompleted += count
+			if progress.VerifyBytesTotal > 0 {
+				progress.Percent = 85 + 14*float64(progress.VerifyBytesCompleted)/float64(progress.VerifyBytesTotal)
+				progress.Percent = min(progress.Percent, 99)
+			}
+			emitter.emit(&progress, false)
+		})
 		if hashErr != nil || hash != entry.Hash {
 			result.Status = StatusFailed
 			result.Message = "恢复后SHA-256校验失败"
 			_ = os.Remove(state.tempPath)
+			updateProgressCounts(&progress, report.Results)
+			emitter.emit(&progress, true)
 			continue
 		}
 		if err := os.Rename(state.tempPath, state.targetPath); err != nil {
 			result.Status = StatusFailed
 			result.Message = err.Error()
+			updateProgressCounts(&progress, report.Results)
+			emitter.emit(&progress, true)
 			continue
 		}
 		_ = fsmeta.SetTimes(state.targetPath, entry.Times.Created, entry.Times.Modified)
+		result.Verified = true
 		if result.Status != StatusConflict {
 			result.Status = StatusRestored
 		}
+		updateProgressCounts(&progress, report.Results)
+		emitter.emit(&progress, true)
 	}
+	progress.Status = "completed"
+	progress.Phase = "completed"
+	progress.Percent = 100
+	progress.Message = "恢复和SHA-256核验完成"
+	progress.CurrentObject = ""
+	progress.CurrentFile = ""
+	updateProgressCounts(&progress, report.Results)
+	emitter.emit(&progress, true)
 	report.FinishedAt = time.Now().UTC()
 	return report, nil
 }
@@ -273,11 +484,27 @@ type outputState struct {
 	written    int64
 }
 
-func extractSelected(payload io.Reader, metadata model.ObjectPayloadMetadata, states map[string]*outputState) error {
+type countingReader struct {
+	reader io.Reader
+	onRead func(int64)
+}
+
+func (r *countingReader) Read(buffer []byte) (int, error) {
+	count, err := r.reader.Read(buffer)
+	if count > 0 && r.onRead != nil {
+		r.onRead(int64(count))
+	}
+	return count, err
+}
+
+func extractSelected(payload io.Reader, metadata model.ObjectPayloadMetadata, states map[string]*outputState, onFile func(model.PayloadFileRecord)) error {
 	records := append([]model.PayloadFileRecord(nil), metadata.Files...)
 	sort.Slice(records, func(i, j int) bool { return records[i].Offset < records[j].Offset })
 	var position int64
 	for _, record := range records {
+		if onFile != nil {
+			onFile(record)
+		}
 		if record.Offset < position {
 			return errors.New("对象元数据偏移无效")
 		}
@@ -320,6 +547,10 @@ const (
 )
 
 func chooseTarget(root string, entry model.FileEntry, casePaths map[string]string) (string, conflictKind, error) {
+	return chooseTargetWithProgress(root, entry, casePaths, nil)
+}
+
+func chooseTargetWithProgress(root string, entry model.FileEntry, casePaths map[string]string, onHash func(int64)) (string, conflictKind, error) {
 	target, err := safeJoin(root, entry.RootAlias, entry.RelativePath)
 	if err != nil {
 		return "", noConflict, err
@@ -339,7 +570,7 @@ func chooseTarget(root string, entry model.FileEntry, casePaths map[string]strin
 	if info.IsDir() {
 		return conflictTarget(root, entry), existingDifferent, nil
 	}
-	hash, err := hashFile(target)
+	hash, err := hashFileWithProgress(target, onHash)
 	if err == nil && hash == entry.Hash {
 		return target, existingSame, nil
 	}
@@ -399,16 +630,48 @@ func validWindowsPath(alias, relative string) bool {
 }
 
 func hashFile(path string) (string, error) {
+	return hashFileWithProgress(path, nil)
+}
+
+func hashFileWithProgress(path string, onRead func(int64)) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
 	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
+	reader := io.Reader(file)
+	if onRead != nil {
+		reader = &countingReader{reader: file, onRead: onRead}
+	}
+	if _, err := io.Copy(hasher, reader); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func updateProgressCounts(progress *Progress, results []FileResult) {
+	progress.FilesCompleted = 0
+	progress.RestoredFiles = 0
+	progress.SkippedFiles = 0
+	progress.FailedFiles = 0
+	progress.VerifiedFiles = 0
+	for _, result := range results {
+		if result.Verified {
+			progress.VerifiedFiles++
+		}
+		switch result.Status {
+		case StatusRestored, StatusConflict:
+			progress.FilesCompleted++
+			progress.RestoredFiles++
+		case StatusSkipped:
+			progress.FilesCompleted++
+			progress.SkippedFiles++
+		case StatusMissing, StatusInvalid, StatusFailed:
+			progress.FilesCompleted++
+			progress.FailedFiles++
+		}
+	}
 }
 
 func selectionMap(selected []string) map[string]struct{} {
